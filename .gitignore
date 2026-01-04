@@ -1,5 +1,6 @@
 .sqlhistory
 .venv
+*.env*
 db/**
 tmp/**
 **/__pycache__/**
