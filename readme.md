@@ -1,4 +1,4 @@
-# Future-implied Volatility Band Strategy Backtest
+# Implied Volatility Band Strategy Backtest
 
 ## Idea
 
