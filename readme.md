@@ -10,6 +10,8 @@ The strategy was backtested on 1-hour candlestick data and daily historical opti
 
 ### Performance Summary
 
+![](fig/SPY_strategy.jpg)
+
 | Metric                        | Buy & Hold | Strategy |
 | ----------------------------- | ---------- | -------- |
 | **Total Return (%)**          | 111.93%    | 118.43%  |
@@ -35,12 +37,16 @@ The strategy was backtested on 1-hour candlestick data and daily historical opti
 
 ### 1. Monte Carlo Simulation
 
+![](fig/SPY_monte_carlo.jpg)
+
 The strategy was run through 1,000 randomized simulations to test the stability of the equity curve.
 
 - **Path Consistency:** The realized strategy path closely tracks the **50th percentile** of simulated outcomes, indicating results are representative of average expectations.
 - **Drawdown Reliability:** Realized drawdowns remained well within the expected distribution, significantly outperforming the 95th percentile of simulated market failures.
 
 ### 2. Timeframe Sensitivity
+
+![](fig/SPY_timeframe_sensitivity.jpg)
 
 The strategy was tested across various timeframes to determine the stability of the edge across different frequencies.
 
@@ -50,12 +56,16 @@ The strategy was tested across various timeframes to determine the stability of 
 
 ### 3. Lag Sensitivity
 
+![](fig/SPY_lag_sensitivity.jpg)
+
 The strategy was tested with execution delays of up to 35 periods to ensure it does not rely on immediate timing.
 
 - **Sharpe Resilience:** The Sharpe Ratio remains robust even under significant execution lag, confirming the risk-adjusted edge is driven by persistent regime shifts.
 - **Alpha Persistence:** Annualized alpha remains positive even with significant delays, showing the signals capture broad trends rather than fleeting price noise.
 
 ### 4. Parameter Stability
+
+![](fig/SPY_parameter_sensitivity.jpg)
 
 Sensitivity heatmaps were used to check if the strategy depends on "perfect" settings.
 
