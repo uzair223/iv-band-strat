@@ -1,76 +1,62 @@
-# Implied Volatility Band Strategy Backtest
+# SPY Vol. Regime-Adaptive Strategy Backtest
 
 ## Idea
 
-This strategy is an intraday mean-reversion system triggered by volatility extremes. It calculates price bands based on implied volatility (the market's expected daily move) and only enters trades when the IV Z-score is high, indicating an environment of elevated fear. Positions are initiated when the price dips below the lower band and begins to recover, or peaks above the upper band and starts to fade. Once a trade is active, an ATR-based trailing stop manages the exit, locking in gains as the price moves favorably without utilizing a fixed profit target.
+This strategy is a regime-adaptive hybrid system that leverages price volatility and technical trends to switch between mean-reversion and trend-following logic. By calculating a **Volatility Z-score**, the system identifies "high-fear" or overextended environments to execute mean-reversion trades using volatility bands. In stable or low-volatility regimes, it shifts to a trend-following mode guided by moving average crossovers. Risk is managed through a **3.0x ATR trailing stop**, ensuring that capital is protected during sudden reversals while allowing winning trades to run.
 
 ## Backtest
 
-The strategy was backtested on 1-hour candlestick data and daily historical options chain data for the S&P 500 (SPY) from January 2020 to January 2026.
+The strategy was backtested on the S&P 500 ETF (SPY) from **January 2020 to January 2026**, capturing the high-volatility COVID-19 era and the subsequent recovery cycles.
 
 ### Performance Summary
 
 ![](fig/SPY_strategy.jpg)
 
-| Metric                        | Buy & Hold | Strategy |
-| ----------------------------- | ---------- | -------- |
-| **Total Return (%)**          | 111.93%    | 118.43%  |
-| **Annualized Return (%)**     | 12.35%     | 12.88%   |
-| **Annualized Volatility (%)** | 15.51%     | 10.87%   |
-| **Sharpe Ratio**              | 0.80       | 1.19     |
-| **Sortino Ratio**             | 0.99       | 0.96     |
-| **Max Drawdown (%)**          | -26.93%    | -10.21%  |
-| **Avg Drawdown (%)**          | -5.94%     | -3.27%   |
-| **Annualized Alpha (%)**      |            | 11.76%   |
-| **Beta (vs Asset)**           |            | 0.09     |
-
 #### Key Insights
 
-- **Risk Mitigation:** The strategy reduced the maximum drawdown by over 60% compared to the benchmark, maintaining a -10.21% floor against the market's -26.93%.
-- **Efficiency:** With a Sharpe Ratio of 1.19, the system outperformed the market's risk-adjusted returns while operating with significantly lower annualized volatility (10.87% vs 15.51%).
-- **Low Correlation:** A Beta of 0.09 indicates the strategy is almost entirely decoupled from standard market swings, relying on mean reversion during volatility spikes.
-- **Alpha Generation:** The strategy produced an Annualized Alpha of 11.76%, demonstrating a strong independent edge over the benchmark.
+- **Hybrid Strategy**: This regime-adaptive system achieved a **276.40% Total Return** with a **Sharpe Ratio of 1.56**. By dynamically switching between logic sets, it captured the highest Annualized Alpha (**17.56%**) while maintaining a defensive profile, effectively smoothing the equity curve during periods of market transition.
+- **Mean Reversion**: This component serves as the primary risk-mitigation engine during high-volatility spikes. It delivered the highest standalone risk-adjusted return relative to its volatility, maintaining a remarkably low **0.09 Beta**. This highlights its ability to profit from "fear-based" overextensions with almost zero correlation to the broader market trend.
+- **Trend Following**: Acting as the "capital preservation" mode during stable regimes, this approach focuses on riding sustained momentum. While it produced a lower annualized return (**9.23%**) than the other modes, it provided the lowest maximum drawdown (**-9.83%**), ensuring the strategy remained invested during low-volatility climbs without over-trading noise.
+- **Risk Mitigation**: The synergy of the three approaches reduced the benchmark's maximum drawdown by over **60%**. The use of a 3.0x ATR trailing stop across all modes ensured that while the Hybrid strategy captured aggressive upside, it successfully avoided the deep "tail-risk" events seen in the Buy & Hold benchmark.
 
 ---
 
-## Robustness and Execution
+## Robustness
 
-### 1. Monte Carlo Simulation
+### Monte-Carlo Simulation
 
 ![](fig/SPY_monte_carlo.jpg)
 
-The strategy was run through 1,000 randomized simulations to test the stability of the equity curve.
+To test for path dependency, the strategy was subjected to 1,000 simulations using a Stationary Bootstrap to shuffle returns while preserving their natural time-series structure.
 
-- **Path Consistency:** The realized strategy path closely tracks the **50th percentile** of simulated outcomes, indicating results are representative of average expectations.
-- **Drawdown Reliability:** Realized drawdowns remained well within the expected distribution, significantly outperforming the 95th percentile of simulated market failures.
+- **Representative Results:** The realized strategy path (red line) tracks the **50th percentile** of simulations, suggesting the backtest is a realistic expectation of average performance.
+- **Risk Floor:** The realized drawdown remained significantly shallower than the 95th percentile of simulated outcomes.
 
-### 2. Timeframe Sensitivity
+### Timeframe Sensitivity
 
 ![](fig/SPY_timeframe_sensitivity.jpg)
 
-The strategy was tested across various timeframes to determine the stability of the edge across different frequencies.
+The strategy was evaluated across intervals from 1-minute to 4-hour bars, while keeping all other parameters temporally constant (i.e. same lookback periods and thresholds).
 
-- **Optimal Window:** The **1-hour timeframe** produces the peak risk-adjusted return with a Sharpe Ratio of approximately 1.2.
-- **Frequency Decay:** Performance remains stable from 5-minute to 4-hour intervals, though it significantly degrades at the 1-minute level where the Sharpe Ratio turns negative.
-- **Beta Stability:** Beta remains near zero across almost all timeframes, confirming the strategy's market-neutral defensive characteristics.
+- **Optimal Window:** Performance peaks at the **1-hour timeframe** (Sharpe ~1.6, Alpha ~17%).
+- **Edge Decay:** Effectiveness drops at the 4-hour scale, suggesting the volatility-band signals are most predictive on intra-day to multi-day horizons.
 
-### 3. Lag Sensitivity
+### Lag Sensitivity
 
 ![](fig/SPY_lag_sensitivity.jpg)
 
-The strategy was tested with execution delays of up to 35 periods to ensure it does not rely on immediate timing.
+Tested execution delays from 0 to 33 periods (~5 6.5hr days) to ensure the strategy isn't dependent on "perfect" fills.
 
-- **Sharpe Resilience:** The Sharpe Ratio remains robust even under significant execution lag, confirming the risk-adjusted edge is driven by persistent regime shifts.
-- **Alpha Persistence:** Annualized alpha remains positive even with significant delays, showing the signals capture broad trends rather than fleeting price noise.
+- **Entry vs. Exit:** The strategy is more sensitive to entry lag, but the **Alpha remains positive** even with significant delays, proving the signals capture structural market shifts rather than fleeting noise.
 
-### 4. Parameter Stability
+### Parameter Sensitivity
 
 ![](fig/SPY_parameter_sensitivity.jpg)
 
-Sensitivity heatmaps were used to check if the strategy depends on "perfect" settings.
+Heatmaps were generated to identify "parameter islands" and ensure stability.
 
-- **Alpha Consistency:** The system maintains a positive **Annualized Alpha** across a wide range of ATR periods and Z-score thresholds.
-- **Optimal Zones:** Performance is most consistent with lower `band_std_dev` values combined with mid-range `vol_z_window` settings, reaching Alphas above 15% in specific clusters.
+- **Consistent Alpha:** The system shows broad "blue zones" of profitability across various combinations of `vol_z_entry_threshold` and `band_std_dev`.
+- **Robustness:** High performance is clustered, not isolated, indicating that slight variations in settings will not collapse the strategy’s edge.
 
 ## Setup
 
@@ -78,8 +64,10 @@ Sensitivity heatmaps were used to check if the strategy depends on "perfect" set
 # Install dependencies
 pip install -r requirements.txt
 
-# Setup Dolt database and indexes
-dolt --data-dir ./db sql -f setup.sql
-dolt --data-dir ./db sql-server
+# Setup data and local environment
+python setup_data.py
+python run_backtest.py --config hybrid_spy.yaml
 
 ```
+
+_Disclaimer: This report is for informational purposes only and does not constitute financial advice. Past performance is not indicative of future results._
