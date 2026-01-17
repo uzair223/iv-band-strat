@@ -70,4 +70,11 @@ python run_backtest.py --config hybrid_spy.yaml
 
 ```
 
+## Run Bot
+
+```bash
+docker build -t trading-bot .
+docker run -d --name my-bot --env-file .env -p 8050:8050 trading-bot
+```
+
 _Disclaimer: This report is for informational purposes only and does not constitute financial advice. Past performance is not indicative of future results._

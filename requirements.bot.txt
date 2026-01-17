@@ -1,0 +1,8 @@
+alpaca-py
+pandas
+numpy
+sqlalchemy
+requests
+python-dotenv
+dash
+plotly
