@@ -19,7 +19,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.models import BarSet, Bar
-from alpaca.trading.models import Order, Position, Asset
+from alpaca.trading.models import Order, Position, Asset, Clock
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +81,9 @@ class HybridStrategy:
         self.timeframe = timeframe
         self.tf_minutes = int(timeframe.total_seconds() / 60)
         self.warmup_lookback = ceil(max(7, bars_to_days(timeframe, atr_period), bars_to_days(timeframe, slow_ma_window)))+1
+        self.max_buf = int(max(atr_period, slow_ma_window) * self.tf_minutes * 1.2)
         
-        self.bar_count = 0
+        self.minute_bar_count = 0
         self.delayed_backfill = delayed_backfill
         self.shutdown = asyncio.Event()
         
@@ -214,10 +215,10 @@ class HybridStrategy:
             self.latest_slow_ma = float(self.history["slow_ma"].iloc[-1])
 
     async def handle_minute_bar(self, bar: Bar):
-        self.bar_count += 1
+        self.minute_bar_count += 1
         logger.info(f"received {bar.timestamp.strftime('%H:%M')} bar")
         
-        if self.bar_count == 15 and self.delayed_backfill:
+        if self.minute_bar_count == 15 and self.delayed_backfill:
             self.fetch_backfill()
         
         new_row = pd.DataFrame([bar.model_dump()]).set_index("timestamp").tz_convert("America/New_York")
@@ -226,6 +227,8 @@ class HybridStrategy:
             self.minute_buffer.index = (
                 pd.to_datetime(self.minute_buffer.index)
             )
+            if len(self.minute_buffer) > self.max_buf:
+                self.minute_buffer = self.minute_buffer.iloc[-self.max_buf:]
         if self.is_ready:
             self.resample_and_sync()
 
@@ -267,7 +270,9 @@ class HybridStrategy:
         
         self.fetch_active_position()
         self.fetch_vol_from_source()
-        if not self.delayed_backfill:
+        
+        clock = cast(Clock, self.trading_client.get_clock())
+        if not self.delayed_backfill or not clock.is_open:
             self.fetch_backfill()
         else:
             logger.info("delayed backfill enabled; waiting for 15 mins of data")

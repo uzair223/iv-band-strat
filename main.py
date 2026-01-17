@@ -22,6 +22,8 @@ API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 DOLT_DB_URI = os.getenv("DOLT_DB_URI")
 
+SYMBOL = os.getenv("SYMBOL", "SPY")
+VOL_SYMBOL = os.getenv("VOL_SYMBOL", SYMBOL)
 TIMEFRAME_HOURS = float(os.getenv("TIMEFRAME_HOURS", 1))
 timeframe = Timedelta(hours=TIMEFRAME_HOURS)
 
@@ -35,11 +37,16 @@ ATR_MULTIPLIER = float(os.getenv("ATR_MULTIPLIER", 3.0))
 FAST_MA_WINDOW = int(os.getenv("FAST_MA_WINDOW", ceil(days_to_bars(timeframe, WEEK))))
 SLOW_MA_WINDOW = int(os.getenv("SLOW_MA_WINDOW", ceil(days_to_bars(timeframe, MONTH))))
 
+LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"
+PAPER = os.getenv("PAPER", "1") == "1"
+DELAYED_BACKFILL = os.getenv("DELAYED_BACKFILL", "1") == "1"
+
 if not API_KEY or not SECRET_KEY:
     raise ValueError("API_KEY and SECRET_KEY must be set")
 
 strat = HybridStrategy(
-    symbol="SPY",
+    symbol=SYMBOL,
+    vol_symbol=VOL_SYMBOL,
     timeframe=timeframe,
     mr_exposure=MR_EXPOSURE,
     tf_exposure=TF_EXPOSURE,
@@ -53,6 +60,9 @@ strat = HybridStrategy(
     api_key=API_KEY,
     secret_key=SECRET_KEY,
     dolt_db_uri=DOLT_DB_URI,
+    long_only=LONG_ONLY,
+    paper=PAPER,
+    delayed_backfill=DELAYED_BACKFILL,
 )
 
 dashboard = Dashboard(strat)
