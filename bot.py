@@ -216,7 +216,6 @@ class HybridStrategy:
 
     async def handle_minute_bar(self, bar: Bar):
         self.minute_bar_count += 1
-        logger.info(f"received {bar.timestamp.strftime('%H:%M')} bar")
         
         if self.minute_bar_count == 15 and self.delayed_backfill:
             self.fetch_backfill()
@@ -297,8 +296,9 @@ class HybridStrategy:
             curr_bar = self.history.iloc[-1]
             last_bar = self.history.iloc[-2]
             
-            upper = self.day_open.iloc[-1] + (self.day_open.iloc[-1] * self.latest_vol_d * self.band_std_dev)
-            lower = self.day_open.iloc[-1] - (self.day_open.iloc[-1] * self.latest_vol_d * self.band_std_dev)
+            vol_dist_move = self.day_open.iloc[-1] * self.latest_vol_d * self.band_std_dev
+            upper = self.day_open.iloc[-1] + vol_dist_move
+            lower = self.day_open.iloc[-1] - vol_dist_move
             
             if self.latest_vol_z >= self.vol_z_entry_threshold:
                 if last_bar["low"] < lower and curr_bar["low"] > lower:
@@ -312,8 +312,12 @@ class HybridStrategy:
                     self.entry_signal = (OrderSide.SELL, Strategy.TREND_FOLLOWING)
 
     def on_bar_closed(self, bar: pd.Series):
-        logger.info(f"bar closed at {cast(pd.Timestamp, bar.name).strftime('%Y-%m-%d %H:%M')}")
         self.refresh_vol_data()
+        logger.info(f"bar closed at %s | close=%.2f | vol_z=%.2f vol_regime=%s | fast_ma=%.2f slow_ma=%.2f trend=%s",
+                    cast(pd.Timestamp, bar.name).strftime('%Y-%m-%d %H:%M %Z'),
+                    bar["close"],
+                    self.latest_vol_z, "high" if self.latest_vol_z >= self.vol_z_entry_threshold else "low",
+                    self.latest_fast_ma, self.latest_slow_ma, "up" if self.latest_fast_ma > self.latest_slow_ma else "down")
         self.evaluate_signals()
         self.execute_trades(bar)
 
