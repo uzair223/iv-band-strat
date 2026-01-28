@@ -5,7 +5,6 @@ from math import ceil
 from typing import cast, Optional
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, text, update
 import numpy as np
 import pandas as pd
 import requests
@@ -215,15 +214,12 @@ class HybridStrategy:
     # === VOLATILITY DATA MANAGEMENT ===
     
     def fetch_vol_from_source(self):
-        query = (
-            text("SELECT DATE_ADD(date, INTERVAL 1 DAY) as timestamp, iv_current as vol FROM volatility_history WHERE act_symbol = :s ORDER BY date DESC LIMIT :l")
-            .bindparams(s=self.vol_symbol, l=self.vol_z_window * 3)
-        )
+        query = "SELECT DATE_ADD(date, INTERVAL 1 DAY) as timestamp, iv_current as vol FROM volatility_history WHERE act_symbol = '%s' ORDER BY date DESC LIMIT %d"
         try:
             owner, database, branch = "post-no-preference", "options", "master"
             res = requests.get(
                 f"https://www.dolthub.com/api/v1alpha1/{owner}/{database}/{branch}",
-                params={"q": query.compile(compile_kwargs={"literal_binds": True}).string}
+                params={"q": query % (self.vol_symbol, self.vol_z_window * 3) }
             )
             data: dict = res.json()
             if (data["query_execution_status"] != "Success"):
@@ -237,6 +233,14 @@ class HybridStrategy:
                 logger.info(f"volatility history updated. current_vol_z={self.latest_vol_z:.2f}")
         except Exception as e:
             logger.error(f"failed to fetch volatility: {e}")
+            
+    def refresh_vol_data(self):
+        now = datetime.now()
+        refresh_threshold = now.replace(hour=6, minute=45, second=0, microsecond=0)
+        if now >= refresh_threshold:
+            if self.last_vol_refresh_time is None or self.last_vol_refresh_time < refresh_threshold:
+                self.fetch_vol_from_source()
+                self.last_vol_refresh_time = now
 
     def calc_vol_stats(self):
         with self.lock:
@@ -345,6 +349,7 @@ class HybridStrategy:
     def on_bar_closed(self, bar: pd.Series):
         self.last_bar = self.curr_bar
         self.curr_bar = bar
+        self.refresh_vol_data()
         logger.info(f"bar closed at %s | close=%.2f | vol_z=%.2f vol_regime=%s | fast_ma=%.2f slow_ma=%.2f trend=%s",
                     cast(pd.Timestamp, bar.name).strftime('%Y-%m-%d %H:%M %Z'),
                     bar["close"],

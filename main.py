@@ -5,7 +5,7 @@ load_dotenv()
 import asyncio
 import threading
 
-from pandas import Timedelta
+from datetime import timedelta
 from bot import HybridStrategy, days_to_bars, WEEK, MONTH
 from dashboard import Dashboard
 
@@ -24,7 +24,7 @@ SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 SYMBOL = os.getenv("SYMBOL", "SPY")
 VOL_SYMBOL = os.getenv("VOL_SYMBOL", SYMBOL)
 TIMEFRAME_HOURS = float(os.getenv("TIMEFRAME_HOURS", 1))
-timeframe = Timedelta(hours=TIMEFRAME_HOURS)
+timeframe = timedelta(hours=TIMEFRAME_HOURS)
 
 MR_EXPOSURE = float(os.getenv("MR_EXPOSURE", 1.0))
 TF_EXPOSURE = float(os.getenv("TF_EXPOSURE", 1.0))

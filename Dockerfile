@@ -5,10 +5,10 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 3. Copy only the requirements file first to leverage Docker caching
-COPY requirements.bot.txt .
+COPY requirements.txt .
 
 # 4. Install dependencies
-RUN pip install --no-cache-dir -r requirements.bot.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 5. Copy only the specific application files
 # These are the three core modules needed for the bot to run

@@ -62,19 +62,13 @@ Heatmaps were generated to identify "parameter islands" and ensure stability.
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
-
-# Setup data and local environment
-python setup_data.py
-python run_backtest.py --config hybrid_spy.yaml
-
+pip install -r requirements.backtest.txt
 ```
 
 ## Run Bot
 
 ```bash
-docker build -t trading-bot .
-docker run -d --name my-bot --env-file .env -p 8050:8050 trading-bot
+docker compose up
 ```
 
 _Disclaimer: This report is for informational purposes only and does not constitute financial advice. Past performance is not indicative of future results._

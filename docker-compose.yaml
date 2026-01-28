@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   hybrid-bot:
     container_name: hybrid-trading-bot
@@ -33,9 +31,3 @@ services:
 
     command: >
       python main.py
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
