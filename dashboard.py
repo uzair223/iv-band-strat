@@ -33,7 +33,6 @@ def update(_):
         with strat.lock:
             hist_df = strat.history.copy()
             vol_df = strat.vol_history.copy()
-            day_open = strat.day_open.copy()
             vol_z = strat.latest_vol_z
             vol_d = strat.latest_vol_d
         
@@ -48,7 +47,7 @@ def update(_):
             direction="forward"
         ).set_index("timestamp").ffill()
         
-        day_open = day_open.reindex(df.index, method="ffill")
+        day_open = hist_df["open"].resample("D").first().reindex(df.index, method="ffill")
         vol_move_dist = day_open * df["vol_d"] * strat.band_std_dev
         df["upper_band"] = day_open + vol_move_dist
         df["lower_band"] = day_open - vol_move_dist

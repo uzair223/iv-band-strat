@@ -20,7 +20,6 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-DOLT_DB_URI = os.getenv("DOLT_DB_URI")
 
 SYMBOL = os.getenv("SYMBOL", "SPY")
 VOL_SYMBOL = os.getenv("VOL_SYMBOL", SYMBOL)
@@ -45,7 +44,7 @@ if not API_KEY or not SECRET_KEY:
     raise ValueError("API_KEY and SECRET_KEY must be set")
 
 strat = HybridStrategy(
-    symbol=SYMBOL,
+    trade_symbol=SYMBOL,
     vol_symbol=VOL_SYMBOL,
     timeframe=timeframe,
     mr_exposure=MR_EXPOSURE,
@@ -59,16 +58,17 @@ strat = HybridStrategy(
     slow_ma_window=SLOW_MA_WINDOW,
     api_key=API_KEY,
     secret_key=SECRET_KEY,
-    dolt_db_uri=DOLT_DB_URI,
     long_only=LONG_ONLY,
     paper=PAPER,
     delayed_backfill=DELAYED_BACKFILL,
 )
 
+HOST = os.getenv("DASH_HOST", "0.0.0.0")
+PORT = int(os.getenv("DASH_PORT", 8050))
 dashboard = Dashboard(strat)
 
 async def main():
-    threading.Thread(target=dashboard.run, kwargs=dict(debug=False, use_reloader=False, host='0.0.0.0', port=8050), daemon=True, name="DashThread").start()
+    threading.Thread(target=dashboard.run, kwargs=dict(debug=False, use_reloader=False, host=HOST, port=PORT), daemon=True, name="DashThread").start()
     bot_task = asyncio.create_task(strat.run())
     try:
         await bot_task
