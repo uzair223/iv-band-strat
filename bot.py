@@ -14,7 +14,7 @@ from uuid import uuid4
 from alpaca.trading import (
     TradingClient, TradingStream,
     MarketOrderRequest, TrailingStopOrderRequest, ReplaceOrderRequest, GetOrdersRequest,
-    Position, Order, Asset, Clock, TradeAccount,
+    Position, Order, Asset, AssetClass, Clock, TradeAccount,
     OrderSide, PositionSide, TimeInForce, QueryOrderStatus,
     TradeUpdate, TradeEvent
 )
@@ -129,8 +129,12 @@ class HybridStrategy:
         self.asset = cast(Asset, self.trading_client.get_asset(trade_symbol))
         if not self.asset.tradable:
             raise ValueError(f"Asset {self.asset.symbol} is not tradable.")
-        self.long_only = long_only or not self.asset.easy_to_borrow
         
+        self.long_only = long_only
+        if not long_only and not self.asset.shortable:
+            self.long_only = True
+            logger.info(f"Asset {self.asset.symbol} is not shortable; forcing long-only mode.")
+            
         # Strategy Params
         self.exposures = {
             Strategy.MEAN_REVERSION: mr_exposure,
@@ -392,9 +396,9 @@ class HybridStrategy:
 
     def execute_trades(self):
         try:
+            self.handle_exit()
             self.update_trailing_stop_order()
             self.handle_entry()
-            self.handle_exit()
         except Exception as e:
             logger.error(f"execution error: {e}")
 
@@ -428,7 +432,7 @@ class HybridStrategy:
         self.trading_client.close_all_positions(cancel_orders=True)
         self.trading_client.submit_order(MarketOrderRequest(
             symbol=self.asset.symbol,
-            qty=qty,
+            qty=int(qty) if self.asset.asset_class == AssetClass.US_EQUITY else qty,
             side=side,
             time_in_force=TimeInForce.GTC,
             client_order_id=cid
@@ -436,7 +440,7 @@ class HybridStrategy:
 
     # === TRAILING STOP LOSS ===
     
-    def create_trailing_stop_order(self, trail_price: Optional[float] = None):
+    def submit_trailing_stop_order(self, trail_price: Optional[float] = None):
         if not self.curr_state:
             logger.warning("no active trade state; cannot create trailing stop")
             return
@@ -564,8 +568,8 @@ class HybridStrategy:
             symbol=order.symbol,
             strategy=parsed.strategy,
             side=order.side,
-            qty=float(order.qty),
+            qty=int(order.qty),
             client_uid=parsed.uid,
         )
         if parsed.with_trailing_stop:
-            self.create_trailing_stop_order()
+            self.submit_trailing_stop_order()
