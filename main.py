@@ -9,8 +9,6 @@ from datetime import timedelta
 from bot import HybridStrategy, days_to_bars, WEEK, MONTH
 from dashboard import Dashboard
 
-from math import ceil
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -31,10 +29,11 @@ TF_EXPOSURE = float(os.getenv("TF_EXPOSURE", 1.0))
 VOL_Z_WINDOW = int(os.getenv("VOL_Z_WINDOW", 21))
 VOL_Z_ENTRY_THRESHOLD = float(os.getenv("VOL_Z_ENTRY_THRESHOLD", 0.0))
 BAND_STD_DEV = float(os.getenv("BAND_STD_DEV", 0.8))
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", ceil(days_to_bars(timeframe, WEEK))))
+
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", days_to_bars(WEEK, timeframe)))
 ATR_MULTIPLIER = float(os.getenv("ATR_MULTIPLIER", 3.0))
-FAST_MA_WINDOW = int(os.getenv("FAST_MA_WINDOW", ceil(days_to_bars(timeframe, WEEK))))
-SLOW_MA_WINDOW = int(os.getenv("SLOW_MA_WINDOW", ceil(days_to_bars(timeframe, MONTH))))
+FAST_MA_WINDOW = int(os.getenv("FAST_MA_WINDOW", days_to_bars(WEEK, timeframe)))
+SLOW_MA_WINDOW = int(os.getenv("SLOW_MA_WINDOW", days_to_bars(MONTH, timeframe)))
 
 LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"
 PAPER = os.getenv("PAPER", "1") == "1"

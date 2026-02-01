@@ -33,24 +33,28 @@ def update(_):
         with strat.lock:
             hist_df = strat.history.copy()
             vol_df = strat.vol_history.copy()
+            day_open = strat.day_open.copy()
             vol_z = strat.latest_vol_z
             vol_d = strat.latest_vol_d
         
-        subset = int(days_to_bars(strat.timeframe, 21))
-        left = hist_df[-subset:].tz_convert("America/New_York").dropna().sort_index().reset_index()
-        right = vol_df.tz_convert("America/New_York").dropna().sort_index().reset_index()
+        hist = hist_df.tz_convert("America/New_York").dropna().sort_index()
+        vol = vol_df.tz_convert("America/New_York").dropna().sort_index()
+        dopen = day_open.rename("day_open").tz_convert("America/New_York").dropna().sort_index()
 
         df = pd.merge_asof(
-            left.sort_values("timestamp"),
-            right.sort_values("timestamp"),
-            on="timestamp",
+            hist, vol,
+            left_index=True, right_index=True,
             direction="forward"
-        ).set_index("timestamp").ffill()
+        )
+        df = pd.merge_asof(
+            df, dopen,
+            left_index=True, right_index=True,
+            direction="forward"
+        ).ffill()
         
-        day_open = hist_df["open"].resample("D").first().reindex(df.index, method="ffill")
-        vol_move_dist = day_open * df["vol_d"] * strat.band_std_dev
-        df["upper_band"] = day_open + vol_move_dist
-        df["lower_band"] = day_open - vol_move_dist
+        vol_move_dist = df["vol_d"] * strat.band_std_dev
+        df["upper_band"] = df["day_open"] * (1 + vol_move_dist)
+        df["lower_band"] = df["day_open"] * (1 - vol_move_dist)
 
         x_axis = np.arange(len(df))
         data = [

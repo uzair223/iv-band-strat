@@ -1,5 +1,5 @@
+**/.**/
 .sqlhistory
-.venv
 *.env*
 db/**
 tmp/**

@@ -3,7 +3,9 @@ import threading
 import logging
 from math import ceil
 from typing import cast, Optional
-from datetime import datetime, timedelta
+
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -13,15 +15,15 @@ from uuid import uuid4
 # Alpaca SDK
 from alpaca.trading import (
     TradingClient, TradingStream,
-    MarketOrderRequest, TrailingStopOrderRequest, ReplaceOrderRequest, GetOrdersRequest,
-    Position, Order, Asset, AssetClass, Clock, TradeAccount,
+    MarketOrderRequest, TrailingStopOrderRequest, ReplaceOrderRequest, GetOrdersRequest, GetCalendarRequest,
+    Position, Order, Asset, AssetClass, Clock, Calendar, TradeAccount,
     OrderSide, PositionSide, TimeInForce, QueryOrderStatus,
     TradeUpdate, TradeEvent
 )
 
 from alpaca.data import (
     StockHistoricalDataClient,
-    StockBarsRequest, TimeFrame,
+    StockBarsRequest, TimeFrame, Sort,
     BarSet, Bar
 )
 from alpaca.data.live.stock import StockDataStream
@@ -34,12 +36,9 @@ WEEK = 5
 MONTH = 21
 HOURS_PER_DAY = 6.5
 
-def days_to_bars(timeframe: timedelta, n=1):
+def days_to_bars(n: float, timeframe: timedelta):
     hours = timeframe.total_seconds() / 3600
-    return HOURS_PER_DAY / hours * n
-
-def bars_to_days(timeframe: timedelta, n=1):
-    return n / days_to_bars(timeframe)
+    return ceil(HOURS_PER_DAY / hours * n)
 
 from enum import Enum
 from dataclasses import dataclass
@@ -106,10 +105,10 @@ class HybridStrategy:
                  band_std_dev = 0.8,
                  vol_z_window = 21,
                  vol_z_entry_threshold = 0.0,
-                 atr_period = ceil(bars_to_days(timedelta(hours=1), WEEK)),
+                 atr_period = days_to_bars(WEEK, timedelta(hours=1)),
                  atr_multiplier = 3.0,
-                 fast_ma_window = ceil(bars_to_days(timedelta(hours=1), WEEK)),
-                 slow_ma_window = ceil(bars_to_days(timedelta(hours=1), MONTH)),
+                 fast_ma_window = days_to_bars(WEEK, timedelta(hours=1)),
+                 slow_ma_window = days_to_bars(MONTH, timedelta(hours=1)),
                  mr_exposure: float = 0.1,
                  tf_exposure: float = 0.1,
                  long_only=False, paper=True, delayed_backfill=True,
@@ -148,9 +147,8 @@ class HybridStrategy:
         
         # Timeframe Handling
         self.timeframe = timeframe
-        self.tf_minutes = int(timeframe.total_seconds() / 60)
-        self.warmup_lookback = ceil(max(7, bars_to_days(timeframe, atr_period), bars_to_days(timeframe, slow_ma_window)))+1
-        self.max_buf = int(max(atr_period, slow_ma_window) * self.tf_minutes * 1.2)
+        self.warmup_timedelta = 1.1 * max(atr_period, slow_ma_window) * timeframe
+        self.max_buf = ceil(self.warmup_timedelta.total_seconds() / 60)
         
         self.minute_bar_count = 0
         self.delayed_backfill = delayed_backfill
@@ -167,14 +165,9 @@ class HybridStrategy:
         self.shutdown_ts = asyncio.Event()
         
         # Indicators
-        self.day_open = 0.0
+        self.day_open = pd.Series(dtype=float)
         self.curr_bar: Optional[pd.Series] = None
         self.last_bar: Optional[pd.Series] = None
-        self.latest_vol_z = 0.0
-        self.latest_vol_d = 0.0
-        self.latest_fast_ma = 0.0
-        self.latest_slow_ma = 0.0
-        self.latest_atr = 0.0
         
         self.entry_signal: Optional[tuple[OrderSide, Strategy, bool]] = None
         self.exit_signal: bool = False
@@ -259,12 +252,23 @@ class HybridStrategy:
     # === DATA INGESTION & AGGREGATION ===
     
     def fetch_backfill(self):
-        logger.info("backfilling historical 1m bars")
-        start_dt = datetime.now() - timedelta(days=self.warmup_lookback)
+        if cast(Clock, self.trading_client.get_clock()).is_open:
+            logger.info("backfilling historical bars")
+            now = datetime.now(UTC)
+        else:
+            logger.info("market is closed; backfilling up to last closed session")
+            today = datetime.now().date()
+            cal = cast(list[Calendar], self.trading_client.get_calendar(GetCalendarRequest(start=today-timedelta(days=2),end=today)))
+            last_session = cal[-1]
+            now = last_session.close.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(UTC)
+                
         req = StockBarsRequest(
             symbol_or_symbols=self.asset.symbol, 
             timeframe=TimeFrame.Minute, # type: ignore
-            start=start_dt
+            end=now,
+            start=datetime.fromtimestamp(0, tz=UTC),
+            sort=Sort.DESC,
+            limit=self.max_buf,
         )
         bars = cast(BarSet, self.data_client.get_stock_bars(req))
         fetched_df = (
@@ -273,22 +277,18 @@ class HybridStrategy:
             [["timestamp","open","high","low","close","volume"]]
             .set_index("timestamp")
             .tz_convert("America/New_York")
+            .sort_index()
         )
         
         with self.lock:
             buf = pd.concat([fetched_df, self.minute_buffer]).drop_duplicates().sort_index()
             self.minute_buffer = buf
-            daily_resample = buf.resample("1D").agg({"open": "first"})
-            if not daily_resample.empty:
-                self.day_open = daily_resample.iloc[-1]["open"]
             self.resample_and_sync()
-            self.evaluate_signals()
             self.is_ready = True
             logger.info(f"warmup complete. buffer size: {len(self.minute_buffer)} mins.")
 
     async def handle_minute_bar(self, bar: Bar):
         self.minute_bar_count += 1
-        
         if self.minute_bar_count == 15 and self.delayed_backfill:
             self.fetch_backfill()
         
@@ -300,8 +300,9 @@ class HybridStrategy:
             )
             if len(self.minute_buffer) > self.max_buf:
                 self.minute_buffer = self.minute_buffer.iloc[-self.max_buf:]
-        if self.is_ready:
-            self.resample_and_sync()
+                
+            if self.is_ready:
+                self.resample_and_sync()
 
     def resample_and_sync(self):
         if self.minute_buffer.empty: return
@@ -322,24 +323,34 @@ class HybridStrategy:
 
         if resampled.empty: return
         latest_idx: pd.Timestamp = resampled.index[-1]
-        latest_tick_time: pd.Timestamp = self.minute_buffer.index[-1]
+        latest_mbar_time: pd.Timestamp = self.minute_buffer.index[-1]
         
         with self.lock:
             self.minute_buffer = self.minute_buffer.tz_convert("America/New_York")
             self.day_open = self.minute_buffer["open"].resample("D").first()
-            if (latest_tick_time.minute % self.tf_minutes) == (self.tf_minutes - 1):
+            self.today_open = self.day_open.iloc[-1]
+            self.history = resampled    
+            self.last_bar = self.history.iloc[-2]
+            self.curr_bar = self.history.iloc[-1]
+            self.calc_indicators()
+            
+            if self.is_ready and self.is_closing_bar(latest_mbar_time):
                 self.on_bar_closed(resampled.iloc[-1])
                 
-            self.history = resampled
-            self.calc_indicators()
             self.last_bar_time = latest_idx
-
+            
+    def is_closing_bar(self, ts: datetime):
+        ts_seconds = int(ts.astimezone(UTC).replace(second=0, microsecond=0).timestamp())
+        tf_seconds = int(self.timeframe.total_seconds())
+        return (ts_seconds+60) % tf_seconds == 0
+        
     def calc_indicators(self):
         with self.lock:
             if len(self.history) < self.slow_ma_window + 1: return
             self.history["tr"] = np.maximum(self.history["high"] - self.history["low"], 
                                 np.maximum(np.abs(self.history["high"] - self.history["close"].shift(1)), 
                                             np.abs(self.history["low"] - self.history["close"].shift(1))))
+            
             self.history["atr"] = self.history["tr"].rolling(window=self.atr_period).mean()
             self.history["fast_ma"] = self.history["close"].ewm(span=self.fast_ma_window, adjust=True).mean()
             self.history["slow_ma"] = self.history["close"].ewm(span=self.slow_ma_window, adjust=True).mean()
@@ -347,12 +358,10 @@ class HybridStrategy:
             self.latest_atr = float(self.history["atr"].iloc[-1])
             self.latest_fast_ma = float(self.history["fast_ma"].iloc[-1])
             self.latest_slow_ma = float(self.history["slow_ma"].iloc[-1])
-            self.latest_lower_band = self.day_open - self.band_std_dev * self.latest_atr
-            self.latest_upper_band = self.day_open + self.band_std_dev * self.latest_atr
+            self.latest_lower_band = self.today_open - self.band_std_dev * self.latest_vol_d
+            self.latest_upper_band = self.today_open + self.band_std_dev * self.latest_vol_d
             
     def on_bar_closed(self, bar: pd.Series):
-        self.last_bar = self.curr_bar
-        self.curr_bar = bar
         self.refresh_vol_data()
         logger.info(f"bar closed at %s | close=%.2f | vol_z=%.2f vol_regime=%s | fast_ma=%.2f slow_ma=%.2f trend=%s",
                     cast(pd.Timestamp, bar.name).strftime('%Y-%m-%d %H:%M %Z'),
