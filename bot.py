@@ -23,7 +23,7 @@ from alpaca.trading import (
 
 from alpaca.data import (
     StockHistoricalDataClient,
-    StockBarsRequest, TimeFrame, Sort,
+    StockBarsRequest, TimeFrame, Sort, DataFeed,
     BarSet, Bar
 )
 from alpaca.data.live.stock import StockDataStream
@@ -111,7 +111,7 @@ class HybridStrategy:
                  slow_ma_window = days_to_bars(MONTH, timedelta(hours=1)),
                  mr_exposure: float = 0.1,
                  tf_exposure: float = 0.1,
-                 long_only=False, paper=True, delayed_backfill=True,
+                 feed=DataFeed.IEX, long_only=False, paper=True, delayed_backfill=True,
                  vol_symbol:Optional[str]=None, pos_symbol: Optional[str]=None):
 
         self.curr_state: Optional[TradeState] = None
@@ -122,6 +122,7 @@ class HybridStrategy:
         self.trading_stream = TradingStream(api_key, secret_key, paper=paper)
         self.data_client = StockHistoricalDataClient(api_key, secret_key)
         self.data_stream = StockDataStream(api_key, secret_key)
+        self.feed = feed
         
         self.pos_symbol = pos_symbol or trade_symbol # for example we trade BTC/USD but the position is in BTCUSD
         self.vol_symbol = vol_symbol or trade_symbol
@@ -269,6 +270,7 @@ class HybridStrategy:
             start=datetime.fromtimestamp(0, tz=UTC),
             sort=Sort.DESC,
             limit=self.max_buf,
+            feed=self.feed,
         )
         bars = cast(BarSet, self.data_client.get_stock_bars(req))
         fetched_df = (
@@ -368,8 +370,10 @@ class HybridStrategy:
                     bar["close"],
                     self.latest_vol_z, "high" if self.latest_vol_z >= self.vol_z_entry_threshold else "low",
                     self.latest_fast_ma, self.latest_slow_ma, "up" if self.latest_fast_ma > self.latest_slow_ma else "down")
-        self.evaluate_signals()
-        self.execute_trades()
+        
+        if self.is_ready:
+            self.evaluate_signals()
+            self.execute_trades()
 
     # === SIGNAL EXECUTION ===
     
