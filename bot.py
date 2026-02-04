@@ -230,7 +230,8 @@ class HybridStrategy:
                     self.calc_vol_stats()
                 logger.info(f"volatility history updated. current_vol_z={self.latest_vol_z:.2f}")
         except Exception as e:
-            logger.error(f"failed to fetch volatility: {e}")
+            e.add_note("error fetching volatility data from source")
+            logger.exception(e)
             
     def refresh_vol_data(self):
         now = datetime.now()
@@ -413,7 +414,8 @@ class HybridStrategy:
             self.update_trailing_stop_order()
             self.handle_entry()
         except Exception as e:
-            logger.error(f"execution error: {e}")
+            e.add_note("error executing trades")
+            logger.exception(e)
 
     def handle_entry(self):
         if not self.entry_signal or self.curr_bar is None:
