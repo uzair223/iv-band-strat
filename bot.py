@@ -15,7 +15,7 @@ from uuid import uuid4
 # Alpaca SDK
 from alpaca.trading import (
     TradingClient, TradingStream,
-    MarketOrderRequest, TrailingStopOrderRequest, ReplaceOrderRequest, GetOrdersRequest, GetCalendarRequest,
+    MarketOrderRequest, StopOrderRequest, ReplaceOrderRequest, GetOrdersRequest, GetCalendarRequest,
     Position, Order, Asset, AssetClass, Clock, Calendar, TradeAccount,
     OrderSide, PositionSide, TimeInForce, QueryOrderStatus,
     TradeUpdate, TradeEvent
@@ -53,31 +53,33 @@ class TradeState:
     strategy: Strategy
     side: OrderSide
     qty: float
-    client_uid: str
-    trailing_apca_id: Optional[str] = None
+    uid: str
+    last_stop_price: Optional[float] = None
+    with_sl: bool = False
+    sl_apca_id: Optional[str] = None
 
 class ParsedClientIdType(str, Enum):
     ENTRY = "ENTRY"
-    TRAIL = "TRAIL"
+    STOP = "STOP"
     
 @dataclass
 class ParsedClientId:
     type: ParsedClientIdType
     strategy: Strategy
     uid: str
-    with_trailing_stop: Optional[bool] = None
+    with_sl: Optional[bool] = None
     parent_uid: Optional[str] = None
     
 class HybridStrategy:
     VERSION = "HSv1"
     
-    def _entry_cid(self, strategy: Strategy, with_trailing_stop: bool) -> str:
+    def _entry_cid(self, strategy: Strategy, with_sl: bool) -> str:
         uid = uuid4().hex[:12]
-        return "::".join((self.VERSION, ParsedClientIdType.ENTRY, strategy, uid, str(int(with_trailing_stop))))
+        return "::".join((self.VERSION, ParsedClientIdType.ENTRY, strategy, uid, str(int(with_sl))))
 
-    def _trail_cid(self, strategy: Strategy, parent_uid: str) -> str:
+    def _sl_uid(self, strategy: Strategy, parent_uid: str) -> str:
         uid = uuid4().hex[:12]
-        return "::".join((self.VERSION, ParsedClientIdType.TRAIL, strategy, uid, parent_uid))
+        return "::".join((self.VERSION, ParsedClientIdType.STOP, strategy, uid, parent_uid))
     
     def _parse_cid(self, cid: str):
         if not cid.startswith(self.VERSION):
@@ -92,8 +94,8 @@ class HybridStrategy:
             uid=parts[3]
         )
         if parsed.type == ParsedClientIdType.ENTRY:
-            parsed.with_trailing_stop = parts[4] == "1"
-        elif parsed.type == ParsedClientIdType.TRAIL:
+            parsed.with_sl = parts[4] == "1"
+        elif parsed.type == ParsedClientIdType.STOP:
             parsed.parent_uid = parts[4]
         return parsed
         
@@ -161,6 +163,7 @@ class HybridStrategy:
         
         # Loop Control
         self.is_ready = False
+        self.is_vol_ready = False
         self.last_bar_time: Optional[pd.Timestamp] = None
         self.shutdown = asyncio.Event()
         self.shutdown_ts = asyncio.Event()
@@ -212,6 +215,7 @@ class HybridStrategy:
     # === VOLATILITY DATA MANAGEMENT ===
     
     def fetch_vol_from_source(self):
+        self.is_vol_ready = False
         query = "SELECT DATE_ADD(date, INTERVAL 1 DAY) as timestamp, iv_current as vol FROM volatility_history WHERE act_symbol = '%s' ORDER BY date DESC LIMIT %d"
         try:
             owner, database, branch = "post-no-preference", "options", "master"
@@ -228,6 +232,7 @@ class HybridStrategy:
                     self.vol_history = pd.DataFrame(rows, columns=["timestamp", "vol"]).set_index("timestamp")
                     self.vol_history.index = pd.to_datetime(self.vol_history.index).tz_localize("America/New_York")
                     self.calc_vol_stats()
+                    self.is_vol_ready = True
                 logger.info(f"volatility history updated. current_vol_z={self.latest_vol_z:.2f}")
         except Exception as e:
             e.add_note("error fetching volatility data from source")
@@ -304,7 +309,7 @@ class HybridStrategy:
             if len(self.minute_buffer) > self.max_buf:
                 self.minute_buffer = self.minute_buffer.iloc[-self.max_buf:]
                 
-            if self.is_ready:
+            if self._ready():
                 self.resample_and_sync()
 
     def resample_and_sync(self):
@@ -337,7 +342,7 @@ class HybridStrategy:
             self.curr_bar = self.history.iloc[-1]
             self.calc_indicators()
             
-            if self.is_ready and self.is_closing_bar(latest_mbar_time):
+            if self._ready() and self.is_closing_bar(latest_mbar_time):
                 self.on_bar_closed(resampled.iloc[-1])
                 
             self.last_bar_time = latest_idx
@@ -372,10 +377,13 @@ class HybridStrategy:
                     self.latest_vol_z, "high" if self.latest_vol_z >= self.vol_z_entry_threshold else "low",
                     self.latest_fast_ma, self.latest_slow_ma, "up" if self.latest_fast_ma > self.latest_slow_ma else "down")
         
-        if self.is_ready:
+        if self._ready():
             self.evaluate_signals()
             self.execute_trades()
 
+    def _ready(self):
+        return self.is_ready and self.is_vol_ready
+    
     # === SIGNAL EXECUTION ===
     
     def evaluate_signals(self):
@@ -409,94 +417,148 @@ class HybridStrategy:
                     self.entry_signal = (OrderSide.SELL, Strategy.TREND_FOLLOWING, False)
 
     def execute_trades(self):
-        try:
-            self.handle_exit()
-            self.update_trailing_stop_order()
-            self.handle_entry()
-        except Exception as e:
-            e.add_note("error executing trades")
-            logger.exception(e)
+        if self.handle_exit():
+            logger.info("exit signal executed")
+            return
+        if self.handle_entry():
+            logger.info("entry signal executed")
+            return
+        self.handle_sl()
+        
+    # === TRADE HANDLERS ===
 
     def handle_entry(self):
         if not self.entry_signal or self.curr_bar is None:
-            return
-        side, strategy, with_trailing_stop = self.entry_signal
+            return False
+        
+        side, strategy, with_sl = self.entry_signal
+
         if self.long_only and side == OrderSide.SELL:
             logger.info("long-only mode; skipping short entry")
-            return
-        self.submit_entry_order(side, strategy, with_trailing_stop, self.curr_bar["close"])
+            return False
+        
+        try:
+            self.submit_entry_order(side, strategy, with_sl, self.curr_bar["close"])
+        except Exception as e:
+            e.add_note("error handling entry")
+            logger.exception(e)
+            return False
+        
         self.entry_signal = None
+        return True
+    
+    def handle_sl(self):
+        if not self.curr_state or self.curr_bar is None:
+            return False
+        try:
+            order, is_replaced = self.upsert_sl_order(self.curr_state, self.curr_bar["close"], update_state=True)
+            if order is not None:
+                logger.info(f"{'modified' if is_replaced else 'submitted'} {order.side} stop order @ {order.stop_price}")
+        except Exception as e:
+            e.add_note("error handling stop order")
+            logger.exception(e)
+            return False
+        return True
+
         
     def handle_exit(self):
         if not self.exit_signal:
-            return
-        self.trading_client.close_all_positions(cancel_orders=True)
+            return False
+        try:
+            self.close_position()
+        except Exception as e:
+            e.add_note("error handling exit")
+            logger.exception(e)
+            return False
         self.exit_signal = False
+        return True
         
-    def submit_entry_order(self, side: OrderSide, strategy: Strategy, with_trailing_stop: bool, price: float):
+    # === ORDER SUBMISSION ===
+    
+    def submit_entry_order(self, side: OrderSide, strategy: Strategy, with_sl: bool, price: float):
         account = cast(TradeAccount, self.trading_client.get_account())
         equity = float(account.equity or 0)
         exposure = self.exposures[strategy]
         qty = (equity * exposure) / price
-
         if qty <= 0:
-            logger.warning(f"{equity=}, {qty=}; skipping entry")
-            return
-
-        cid = self._entry_cid(strategy, with_trailing_stop)
-        self.trading_client.close_all_positions(cancel_orders=True)
-        self.trading_client.submit_order(MarketOrderRequest(
+            raise ValueError("calculated order quantity is zero or negative")
+        
+        cid = self._entry_cid(strategy, with_sl)
+        self.close_position()
+        order = self.trading_client.submit_order(MarketOrderRequest(
             symbol=self.asset.symbol,
             qty=int(qty) if self.asset.asset_class == AssetClass.US_EQUITY else qty,
             side=side,
             time_in_force=TimeInForce.GTC,
             client_order_id=cid
         ))
+        return cast(Order, order)
 
-    # === TRAILING STOP LOSS ===
-    
-    def submit_trailing_stop_order(self, trail_price: Optional[float] = None):
-        if not self.curr_state:
-            logger.warning("no active trade state; cannot create trailing stop")
-            return
-        
-        if trail_price is None:
-            trail_price = self.latest_atr * self.atr_multiplier
-        
-        if trail_price <= 0:
-            logger.warning("trail_price <= 0; cannot create trailing stop")
-            return
-        
-        cid = self._trail_cid(self.curr_state.strategy, self.curr_state.client_uid)
-        order = cast(Order, self.trading_client.submit_order(TrailingStopOrderRequest(
-            symbol=self.asset.symbol,
-            qty=self.curr_state.qty,
-            side=OrderSide.SELL if self.curr_state.side == OrderSide.BUY else OrderSide.BUY,
-            trail_price=trail_price,
-            time_in_force=TimeInForce.GTC,
-            client_order_id=cid,
+    def close_position(self):
+        open_orders = cast(list[Order], self.trading_client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=[self.asset.symbol],
         )))
-        self.curr_state.trailing_apca_id = str(order.id)
-        logger.info(f"created trailing stop order with trail price: {trail_price:.2f}")
-        
-    def update_trailing_stop_order(self, trail_price: Optional[float] = None):
-        if not self.curr_state or not self.curr_state.trailing_apca_id:
-            return
-        
-        if trail_price is None:
-            trail_price = self.latest_atr * self.atr_multiplier
-        
-        if trail_price <= 0:
-            logger.warning("trail_price <= 0; cannot update trailing stop")
-            return
-        
-        trail_amount = self.latest_atr * self.atr_multiplier
-        self.trading_client.replace_order_by_id(
-            self.curr_state.trailing_apca_id,
-            ReplaceOrderRequest(trail=trail_amount)
-        )
-        logger.info(f"updated trailing stop to new trail price: {trail_amount:.2f}")
-    
+        for o in open_orders:
+            self.trading_client.cancel_order_by_id(o.id)
+        order = self.trading_client.close_position(self.asset.symbol)
+        return cast(Order, order)
+            
+    def upsert_sl_order(self, state: TradeState, price: float, update_state=True):
+        if not state.with_sl:
+            return None, None  # no-op if SL not enabled
+
+        trail = self.latest_atr * self.atr_multiplier
+        if trail <= 0:
+            raise ValueError("calculated ATR trail <= 0")
+
+        cid = self._sl_uid(state.strategy, state.uid)
+
+        # determine stop side and price
+        if state.side == OrderSide.BUY:
+            side = OrderSide.SELL
+            stop = price - trail
+            if state.last_stop_price is not None:
+                stop = max(state.last_stop_price, stop)
+        else:
+            side = OrderSide.BUY
+            stop = price + trail
+            if state.last_stop_price is not None:
+                stop = min(state.last_stop_price, stop)
+
+        stop = round(stop, 2)
+
+        # submit new stop order if none exists
+        if state.sl_apca_id is None:
+            order = self.trading_client.submit_order(
+                StopOrderRequest(
+                    symbol=self.asset.symbol,
+                    qty=state.qty,
+                    side=side,
+                    stop_price=stop,
+                    time_in_force=TimeInForce.GTC,
+                    client_order_id=cid,
+                )
+            )
+        else:
+            # modify existing stop if needed
+            if stop == state.last_stop_price:
+                return None, None # nothing to do
+            order = self.trading_client.replace_order_by_id(
+                str(state.sl_apca_id),
+                ReplaceOrderRequest(
+                    stop_price=stop,
+                    client_order_id=cid,
+                )
+            )
+
+        order = cast(Order, order)
+        is_replaced = state.sl_apca_id is not None
+        if order is not None and update_state:
+            state.sl_apca_id = str(order.id)
+            state.last_stop_price = float(str(order.stop_price))
+        return order, is_replaced
+
     # === TRADE DATA STREAM HANDLERS ===
     
     def has_open_position(self) -> bool:
@@ -532,8 +594,9 @@ class HybridStrategy:
                     strategy=parsed.strategy,
                     side=o.side,
                     qty=abs(float(o.qty)),
-                    client_uid=parsed.uid,
-                    trailing_apca_id=None
+                    uid=parsed.uid,
+                    with_sl=bool(parsed.with_sl),
+                    sl_apca_id=None
                 )
                 break
             
@@ -541,7 +604,7 @@ class HybridStrategy:
             logger.warning("no matching entry order for open position")
             return
 
-        # find existing trailing stop order
+        # find existing stop order
         orders = cast(list[Order], self.trading_client.get_orders(GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
             side=OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY,
@@ -552,8 +615,8 @@ class HybridStrategy:
                 parsed = self._parse_cid(o.client_order_id)
             except:
                 continue
-            if parsed.type == ParsedClientIdType.TRAIL and parsed.parent_uid == self.curr_state.client_uid:
-                self.curr_state.trailing_apca_id = str(o.id)
+            if parsed.type == ParsedClientIdType.STOP and parsed.parent_uid == self.curr_state.uid:
+                self.curr_state.sl_apca_id = str(o.id)
                 break
         logger.info(f"reconstructed trade state: {self.curr_state}")
         
@@ -564,7 +627,8 @@ class HybridStrategy:
     def on_fill(self, order: Order):
         if order.symbol != self.asset.symbol:
             return
-        if not order.symbol or not order.side or not order.qty or not order.id:
+        
+        if not order.symbol or not order.side or not order.qty or not order.id or not order.filled_avg_price:
             logger.error("incomplete order data; cannot process fill")
             return
         
@@ -578,13 +642,15 @@ class HybridStrategy:
         except ValueError:
             return
         
-
-        self.curr_state = TradeState(
-            symbol=order.symbol,
-            strategy=parsed.strategy,
-            side=order.side,
-            qty=int(order.qty),
-            client_uid=parsed.uid,
-        )
-        if parsed.with_trailing_stop:
-            self.submit_trailing_stop_order()
+        if parsed.type == ParsedClientIdType.ENTRY:
+            self.curr_state = TradeState(
+                symbol=order.symbol,
+                strategy=parsed.strategy,
+                side=order.side,
+                with_sl=bool(parsed.with_sl),
+                qty=int(order.qty),
+                uid=parsed.uid,
+            )
+            stop_order = self.upsert_sl_order(self.curr_state, float(order.filled_avg_price))[0]
+            if stop_order is not None:
+                logger.info(f"submitted {stop_order.side} stop order @ {stop_order.stop_price}")
