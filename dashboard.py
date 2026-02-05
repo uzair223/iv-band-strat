@@ -1,141 +1,136 @@
-from dash import Dash, dcc, callback, Input, Output
+from dash import Dash, dcc, html, callback, Input, Output
+import dash_bootstrap_components as dbc
 import plotly.graph_objs as go
-import plotly.express as px
 import numpy as np
 import pandas as pd
-from bot import HybridStrategy, days_to_bars
+from bot import HybridStrategy
 
 import logging
 logger = logging.getLogger(__name__)
 
-REFRESH_INTERVAL = 1_000
+# Constants for UI
+REFRESH_INTERVAL = 2_000 # 2 seconds
+THEME = dbc.themes.LUMEN
 
 dashboard = None
-app = Dash()
-app.layout = [
-        dcc.Interval(
-        id="interval-component",
-        interval=REFRESH_INTERVAL,
-    ),
-    dcc.Graph(id="live-graph", style={"width": "95vw", "height": "95vh", "margin": "auto"}),
-]
+app = Dash(__name__, external_stylesheets=[THEME])
+
+def create_card(label, value, id):
+    return dbc.Card(
+        dbc.CardBody([
+            html.H6(label, className="card-subtitle text-muted"),
+            html.H4(value, id=id, className="card-title"),
+        ]),
+        className="mb-2"
+    )
+
+app.layout = dbc.Container([
+    dbc.Row([
+        dbc.Col(html.H2("Hybrid Strategy Monitor", className="text-center py-3"), width=12)
+    ]),
+    
+    dbc.Row([
+        dbc.Col(create_card("Regime", "-", "card-regime"), width=2),
+        dbc.Col(create_card("Vol Z-Score", "-", "card-vol-z"), width=2),
+        dbc.Col(create_card("IV (%)", "-", "card-vol-d"), width=2),
+        dbc.Col(create_card("Trend", "-", "card-trend"), width=2),
+        dbc.Col(create_card("Active Position", "-", "card-pos"), width=2),
+    ], className="justify-content-center mb-4"),
+
+    dbc.Row([
+        dbc.Col([
+            dcc.Interval(id="interval-component", interval=REFRESH_INTERVAL),
+            dcc.Graph(id="live-graph", style={"height": "60vh"}),
+        ], width=12)
+    ]),
+], fluid=True)
 
 @callback(
-    Output("live-graph", "figure"),
+    [Output("live-graph", "figure"),
+     Output("card-regime", "children"),
+     Output("card-vol-z", "children"),
+     Output("card-vol-d", "children"),
+     Output("card-trend", "children"),
+     Output("card-pos", "children")],
     [Input("interval-component", "n_intervals")]
 )
 def update(_):
     try:
         if dashboard is None or not dashboard.strat.is_ready:
-            return go.Figure()
+            return go.Figure(), "-", "-", "-", "-", "-"
+        
         strat = dashboard.strat
         
         with strat.lock:
             hist_df = strat.history.copy()
             vol_df = strat.vol_history.copy()
-            day_open = strat.day_open.copy()
+            curr_state = strat.curr_state
+            
             vol_z = strat.latest_vol_z
             vol_d = strat.latest_vol_d
-        
+            fast_ma = strat.latest_fast_ma
+            slow_ma = strat.latest_slow_ma
+
+        # Data Processing
         hist = hist_df.tz_convert("America/New_York").dropna().sort_index()
         vol = vol_df.tz_convert("America/New_York").dropna().sort_index()
-        dopen = day_open.rename("day_open").tz_convert("America/New_York").dropna().sort_index()
 
-        df = pd.merge_asof(
-            hist, vol,
-            left_index=True, right_index=True,
-            direction="forward"
-        )
-        df = pd.merge_asof(
-            df, dopen,
-            left_index=True, right_index=True,
-            direction="forward"
-        ).ffill()
+        day_open = hist["open"].resample("1D").first()
+        hist["day_open"] = day_open.reindex(hist.index, method="ffill")
+
+        df = pd.merge_asof(hist, vol, left_index=True, right_index=True, direction="forward").ffill()
         
         vol_move_dist = df["vol_d"] * strat.band_std_dev
         df["upper_band"] = df["day_open"] * (1 + vol_move_dist)
         df["lower_band"] = df["day_open"] * (1 - vol_move_dist)
 
         x_axis = np.arange(len(df))
-        data = [
-            # Price and Indicators
-            go.Candlestick(
-                x=x_axis, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-                name="Price", xaxis="x", yaxis="y"
-            ),
-            go.Scatter(
-                x=x_axis, y=df["upper_band"], line_shape="hv",
-                line_color="rgba(173, 216, 230, 0.8)", 
-                name=f"+{strat.band_std_dev}\u03C3 Vol Band", legendgroup="Indicators",
-                xaxis="x", yaxis="y"
-            ),
-            go.Scatter(
-                x=x_axis, y=df["lower_band"], line_shape="hv",
-                line_color="rgba(173, 216, 230, 0.8)", fill="tonexty", fillcolor="rgba(173, 216, 230, 0.3)",
-                name=f"-{strat.band_std_dev}\u03C3 Vol Band", legendgroup="Indicators",
-                xaxis="x", yaxis="y"
-            ),
-            go.Scatter(
-                x=x_axis, y=df["fast_ma"], line_color="orange", line_dash="dot", opacity=0.8,
-                showlegend=False, legendgroup="Indicators", name=f"Fast MA({strat.fast_ma_window})",
-            ),
-            go.Scatter(
-                x=x_axis, y=df["slow_ma"], line_color="purple", line_dash="dot", opacity=0.8,
-                showlegend=False, legendgroup="Indicators", name=f"Slow MA({strat.slow_ma_window})",
-            ),
-            go.Scatter(
-                x=x_axis, y=df["vol_d"],
-                line_color=px.colors.qualitative.Plotly[0], name="Vol", showlegend=False,
-                xaxis="x", yaxis="y2"
-            ),
-            go.Scatter(
-                x=x_axis, y=df["vol_ma"],
-                line_color=px.colors.qualitative.Plotly[1], name=f"Vol MA({strat.vol_z_window})", showlegend=False,
-                xaxis="x", yaxis="y2"
-            ),
-            go.Scatter(
-                x=x_axis, y=df["vol_z"],
-                line_color=px.colors.qualitative.Plotly[0], name="Vol Z-Score", showlegend=False,
-                xaxis="x", yaxis="y3"
-            ),
-            go.Scatter(
-                x=x_axis, y=np.repeat(strat.vol_z_entry_threshold, len(x_axis)),
-                line_color="gray", showlegend=False, hoverinfo="skip",
-                xaxis="x", yaxis="y3"
-            ),		
-        ]
+        
+        # Determine Card Values
+        regime_text = "High Vol" if vol_z >= strat.vol_z_entry_threshold else "Low Vol"
+        trend_text = "Bullish" if fast_ma > slow_ma else "Bearish"
+        pos_text = f"{curr_state.side} {curr_state.qty} (@{curr_state.strategy})" if curr_state else "Flat"
 
-        spacing=0.01
-        rh = (rh := np.array([2, 1, 1])[::-1]) / np.sum(rh)
-        ydomains = [(np.sum(rh[:i])+(spacing * (i != 0)), np.sum(rh[:i+1])-(spacing * (i != len(rh)-1))) for i in range(len(rh))][::-1]
+        # Build Graph
+        fig = go.Figure()
 
-        layout = dict(
-            title=f"Live Strategy: {vol_z=:.2f} {vol_d=:.2%}",
-            hoversubplots="axis",
-            hovermode="x",
-            grid=dict(rows=len(rh), columns=1),
-            legend=dict(
-                orientation="h",
-                yanchor="top", y=-0.01,
-                xanchor="left", x=0,
-            ),
+        # 1. Price Subplot
+        fig.add_trace(go.Candlestick(
+            x=x_axis, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+            name="Price"
+        ))
+        
+        fig.add_trace(go.Scatter(x=x_axis, y=df["upper_band"], line=dict(color='cyan', width=1, dash='dot'), name="Vol Band +"))
+        fig.add_trace(go.Scatter(x=x_axis, y=df["lower_band"], line=dict(color='cyan', width=1, dash='dot'), fill='tonexty', name="Vol Band -"))
+        
+        fig.add_trace(go.Scatter(x=x_axis, y=df["fast_ma"], line=dict(color='orange', width=1.5), name="Fast MA"))
+        fig.add_trace(go.Scatter(x=x_axis, y=df["slow_ma"], line=dict(color='magenta', width=1.5), name="Slow MA"))
+
+        # 2. Volatility Subplot
+        fig.add_trace(go.Scatter(x=x_axis, y=df["vol_z"], name="Vol Z-Score", yaxis="y2", line=dict(color='gold')))
+        fig.add_hline(y=strat.vol_z_entry_threshold, line_dash="dash", line_color="red", yref="y2")
+
+        # Layout styling
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            hovermode="x unified",
+            margin=dict(l=0, r=0, t=0, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            yaxis=dict(title="Price", domain=[0.35, 1]),
+            yaxis2=dict(title="Vol Z", domain=[0, 0.25]),
             xaxis=dict(
-                matches="x",
-                showticklabels=False, showgrid=False,
-                showspikes=True, spikemode="across", spikethickness=1,
-                tickvals=x_axis, ticktext=df.index.strftime("%a %d %b %Y %H:%M %Z").to_list(), # type: ignore
-                rangeslider=dict(visible=False)
-            ),
-            yaxis =dict(domain=ydomains[0], title="Price", automargin=True),
-            yaxis2=dict(domain=ydomains[1], title=f"Vol", automargin=True),
-            yaxis3=dict(domain=ydomains[2], title="Vol Z-Score", automargin=True),
+                tickvals=x_axis,
+                ticktext=df.index.strftime("%a %b %d %H:%M"), # type: ignore
+                showgrid=False,
+                showticklabels=False,
+            )
         )
 
-        fig = go.Figure(data=data, layout=layout)
-        return fig
+        return fig, regime_text, f"{vol_z:.2f}", f"{vol_d:.2%}", trend_text, pos_text
+
     except Exception as e:
-        logger.error(f"Error in dashboard update: {e}")
-        return go.Figure()
+        logger.error(f"Dashboard error: {e}")
+        return go.Figure(), "Error", "Error", "Error", "Error", "Error"
 
 class Dashboard:
     def __init__(self, strat: HybridStrategy):
@@ -143,6 +138,5 @@ class Dashboard:
 
     def run(self, **kwargs):
         global dashboard
-        assert dashboard is None, "Dash app is already running"
         dashboard = self
         app.run(**kwargs)

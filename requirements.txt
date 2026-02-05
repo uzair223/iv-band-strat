@@ -1,5 +1,6 @@
 alpaca-py
 dash
+dash-bootstrap-components
 dotenv
 numpy
 pandas

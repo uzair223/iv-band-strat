@@ -335,7 +335,7 @@ class HybridStrategy:
         
         with self.lock:
             self.minute_buffer = self.minute_buffer.tz_convert("America/New_York")
-            self.day_open = self.minute_buffer["open"].resample("D").first()
+            self.day_open = self.minute_buffer["open"].resample("1D").first()
             self.today_open = self.day_open.iloc[-1]
             self.history = resampled    
             self.last_bar = self.history.iloc[-2]
