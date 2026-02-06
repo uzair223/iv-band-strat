@@ -105,8 +105,8 @@ class HybridStrategy:
                  trade_symbol: str,
                  timeframe=timedelta(hours=1), 
                  band_std_dev = 0.8,
-                 vol_z_window = 21,
-                 vol_z_entry_threshold = 0.0,
+                 vol_rank_window = 21,
+                 vol_rank_entry_threshold = 50.0,
                  atr_period = days_to_bars(WEEK, timedelta(hours=1)),
                  atr_multiplier = 3.0,
                  fast_ma_window = days_to_bars(WEEK, timedelta(hours=1)),
@@ -143,14 +143,14 @@ class HybridStrategy:
             Strategy.TREND_FOLLOWING: tf_exposure
         }
         self.band_std_dev = band_std_dev
-        self.vol_z_window = vol_z_window
-        self.vol_z_entry_threshold = vol_z_entry_threshold
+        self.vol_rank_window = vol_rank_window
+        self.vol_rank_entry_threshold = vol_rank_entry_threshold
         self.atr_period, self.atr_multiplier = atr_period, atr_multiplier
         self.fast_ma_window, self.slow_ma_window = fast_ma_window, slow_ma_window
         
         # Timeframe Handling
         self.timeframe = timeframe
-        self.warmup_timedelta = 1.1 * max(atr_period, slow_ma_window) * timeframe
+        self.warmup_timedelta = 2 * max(atr_period, slow_ma_window) * timeframe
         self.max_buf = ceil(self.warmup_timedelta.total_seconds() / 60)
         
         self.minute_bar_count = 0
@@ -162,14 +162,14 @@ class HybridStrategy:
         self.vol_history = pd.DataFrame()
         
         # Loop Control
-        self.is_ready = False
-        self.is_vol_ready = False
+        self.is_bfill_fetched = False
+        self.is_vol_fetched = False
         self.last_bar_time: Optional[pd.Timestamp] = None
         self.shutdown = asyncio.Event()
         self.shutdown_ts = asyncio.Event()
         
         # Indicators
-        self.day_open = pd.Series(dtype=float)
+        self.daily_open = pd.Series(dtype=float)
         self.curr_bar: Optional[pd.Series] = None
         self.last_bar: Optional[pd.Series] = None
         
@@ -177,7 +177,7 @@ class HybridStrategy:
         self.exit_signal: bool = False
         
         # Refresh tracking
-        self.last_vol_refresh_time: Optional[datetime] = None
+        self.last_vol_refresh_time = datetime.min.replace(tzinfo=UTC)
 
     # === STREAM MANAGEMENT ===
     
@@ -187,22 +187,24 @@ class HybridStrategy:
         
         self.data_stream.subscribe_bars(self.handle_minute_bar, self.asset.symbol) # type: ignore
         self.trading_stream.subscribe_trade_updates(self.handle_trade_updates)
-        
-        self.fetch_vol_from_source()
+        tasks = [
+            asyncio.create_task(self.data_stream._run_forever()),
+            asyncio.create_task(self.trading_stream._run_forever()),
+            asyncio.create_task(asyncio.to_thread(self.refresh_vol_data))
+        ]
         clock = cast(Clock, self.trading_client.get_clock())
         if not self.delayed_backfill or not clock.is_open:
-            self.fetch_backfill()
+            tasks.append(asyncio.create_task(asyncio.to_thread(self.fetch_backfill)))
         else:
             logger.info("delayed backfill enabled; waiting for 15 mins of data")
         
         try:
-            await asyncio.gather(
-                self.data_stream._run_forever(),
-                self.trading_stream._run_forever()
-            )
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
         finally:
+            for task in tasks:
+                task.cancel()
             await self.stop()
 
     async def stop(self):
@@ -215,13 +217,14 @@ class HybridStrategy:
     # === VOLATILITY DATA MANAGEMENT ===
     
     def fetch_vol_from_source(self):
-        self.is_vol_ready = False
+        logger.info("fetching volatility data from source")
+        self.is_vol_fetched = False
         query = "SELECT DATE_ADD(date, INTERVAL 1 DAY) as timestamp, iv_current as vol FROM volatility_history WHERE act_symbol = '%s' ORDER BY date DESC LIMIT %d"
         try:
             owner, database, branch = "post-no-preference", "options", "master"
             res = requests.get(
                 f"https://www.dolthub.com/api/v1alpha1/{owner}/{database}/{branch}",
-                params={"q": query % (self.vol_symbol, self.vol_z_window * 3) }
+                params={"q": query % (self.vol_symbol, 50 + self.vol_rank_window * 3) }
             )
             data: dict = res.json()
             if (data["query_execution_status"] != "Success"):
@@ -232,29 +235,31 @@ class HybridStrategy:
                     self.vol_history = pd.DataFrame(rows, columns=["timestamp", "vol"]).set_index("timestamp")
                     self.vol_history.index = pd.to_datetime(self.vol_history.index).tz_localize("America/New_York")
                     self.calc_vol_stats()
-                    self.is_vol_ready = True
-                logger.info(f"volatility history updated. current_vol_z={self.latest_vol_z:.2f}")
+                    self.is_vol_fetched = True
+                logger.info(f"volatility history updated. fetched {len(rows)} rows. {self.latest_vol_rank=:.2f}, {self.latest_vol_d=:.2f}")
         except Exception as e:
             e.add_note("error fetching volatility data from source")
             logger.exception(e)
             
     def refresh_vol_data(self):
-        now = datetime.now()
+        now = datetime.now(UTC)
         refresh_threshold = now.replace(hour=6, minute=45, second=0, microsecond=0)
-        if now >= refresh_threshold:
-            if self.last_vol_refresh_time is None or self.last_vol_refresh_time < refresh_threshold:
+        if now >= refresh_threshold and self.last_vol_refresh_time < refresh_threshold:
                 self.fetch_vol_from_source()
                 self.last_vol_refresh_time = now
 
     def calc_vol_stats(self):
         with self.lock:
-            if len(self.vol_history) < 2: return
-            self.vol_history["vol_d"] = pd.to_numeric(self.vol_history["vol"], errors="coerce").ffill() * np.sqrt(1 / YEAR)
-            self.vol_history["vol_ma"] = self.vol_history["vol_d"].ewm(span=self.vol_z_window, adjust=True).mean()
-            self.vol_history["vol_sd"] = self.vol_history["vol_d"].ewm(span=self.vol_z_window, adjust=True).std()
-            self.vol_history["vol_z"] = (self.vol_history["vol_d"] - self.vol_history["vol_ma"]) / (self.vol_history["vol_sd"] + 0.01)
-            self.latest_vol_z = float(self.vol_history["vol_z"].iloc[-1])
-            self.latest_vol_d = float(self.vol_history["vol_d"].iloc[-1])
+            vol_history_df = self.vol_history.copy()
+        if len(vol_history_df) < 2: return
+        
+        vol_history_df["vol_d"] = pd.to_numeric(vol_history_df["vol"], errors="coerce").ffill() * np.sqrt(1 / YEAR)
+        vol_history_df["vol_rank"] = vol_history_df["vol_d"].rolling(window=self.vol_rank_window).rank(pct=True) * 100
+        
+        with self.lock:
+            self.vol_history = vol_history_df
+            self.latest_vol_rank = float(vol_history_df["vol_rank"].iloc[-1])
+            self.latest_vol_d = float(vol_history_df["vol_d"].iloc[-1])
 
     # === DATA INGESTION & AGGREGATION ===
     
@@ -264,7 +269,7 @@ class HybridStrategy:
             now = datetime.now(UTC)
         else:
             logger.info("market is closed; backfilling up to last closed session")
-            today = datetime.now().date()
+            today = datetime.now(UTC).date()
             cal = cast(list[Calendar], self.trading_client.get_calendar(GetCalendarRequest(start=today-timedelta(days=2),end=today)))
             last_session = cal[-1]
             now = last_session.close.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(UTC)
@@ -292,13 +297,13 @@ class HybridStrategy:
             buf = pd.concat([fetched_df, self.minute_buffer]).drop_duplicates().sort_index()
             self.minute_buffer = buf
             self.resample_and_sync()
-            self.is_ready = True
+            self.is_bfill_fetched = True
             logger.info(f"warmup complete. buffer size: {len(self.minute_buffer)} mins.")
 
     async def handle_minute_bar(self, bar: Bar):
         self.minute_bar_count += 1
         if self.minute_bar_count == 15 and self.delayed_backfill:
-            self.fetch_backfill()
+            await asyncio.to_thread(self.fetch_backfill)
         
         new_row = pd.DataFrame([bar.model_dump()]).set_index("timestamp").tz_convert("America/New_York")
         with self.lock:
@@ -308,15 +313,15 @@ class HybridStrategy:
             )
             if len(self.minute_buffer) > self.max_buf:
                 self.minute_buffer = self.minute_buffer.iloc[-self.max_buf:]
-                
-            if self._ready():
-                self.resample_and_sync()
+            self.resample_and_sync()
 
     def resample_and_sync(self):
-        if self.minute_buffer.empty: return
+        with self.lock:
+            minute_df = self.minute_buffer.copy().tz_convert("America/New_York")
+        if minute_df.empty: return
 
         resampled = (
-            self.minute_buffer
+            minute_df
             .resample(self.timeframe, label="left", closed="left")
             .agg({
                 "open": "first",
@@ -331,21 +336,21 @@ class HybridStrategy:
 
         if resampled.empty: return
         latest_idx: pd.Timestamp = resampled.index[-1]
-        latest_mbar_time: pd.Timestamp = self.minute_buffer.index[-1]
+        latest_mbar_time: pd.Timestamp = minute_df.index[-1]
         
         with self.lock:
-            self.minute_buffer = self.minute_buffer.tz_convert("America/New_York")
-            self.day_open = self.minute_buffer["open"].resample("1D").first()
-            self.today_open = self.day_open.iloc[-1]
-            self.history = resampled    
-            self.last_bar = self.history.iloc[-2]
-            self.curr_bar = self.history.iloc[-1]
-            self.calc_indicators()
+            self.last_bar_time = latest_idx
+            self.minute_buffer = minute_df
+            self.history = resampled
             
-            if self._ready() and self.is_closing_bar(latest_mbar_time):
+            self.curr_bar = resampled.iloc[-1]
+            if len(resampled) > 1:
+                self.last_bar = resampled.iloc[-2]
+                
+            self.calc_indicators()
+            if self.is_ready() and self.is_closing_bar(latest_mbar_time):
                 self.on_bar_closed(resampled.iloc[-1])
                 
-            self.last_bar_time = latest_idx
             
     def is_closing_bar(self, ts: datetime):
         ts_seconds = int(ts.astimezone(UTC).replace(second=0, microsecond=0).timestamp())
@@ -353,36 +358,44 @@ class HybridStrategy:
         return (ts_seconds+60) % tf_seconds == 0
         
     def calc_indicators(self):
+        if not self.is_vol_fetched:
+            return
+        
         with self.lock:
-            if len(self.history) < self.slow_ma_window + 1: return
-            self.history["tr"] = np.maximum(self.history["high"] - self.history["low"], 
-                                np.maximum(np.abs(self.history["high"] - self.history["close"].shift(1)), 
-                                            np.abs(self.history["low"] - self.history["close"].shift(1))))
-            
-            self.history["atr"] = self.history["tr"].rolling(window=self.atr_period).mean()
-            self.history["fast_ma"] = self.history["close"].ewm(span=self.fast_ma_window, adjust=True).mean()
-            self.history["slow_ma"] = self.history["close"].ewm(span=self.slow_ma_window, adjust=True).mean()
-            
-            self.latest_atr = float(self.history["atr"].iloc[-1])
-            self.latest_fast_ma = float(self.history["fast_ma"].iloc[-1])
-            self.latest_slow_ma = float(self.history["slow_ma"].iloc[-1])
-            self.latest_lower_band = self.today_open - self.band_std_dev * self.latest_vol_d
-            self.latest_upper_band = self.today_open + self.band_std_dev * self.latest_vol_d
+            history_df = self.history.copy()
+        if len(history_df) < max(self.atr_period, self.slow_ma_window) + 1: return
+        
+        history_df["tr"] = np.maximum(history_df["high"] - history_df["low"], 
+                    np.maximum(np.abs(history_df["high"] - history_df["close"].shift(1)), 
+                                np.abs(history_df["low"] - history_df["close"].shift(1))))
+        history_df["atr"] = history_df["tr"].rolling(window=self.atr_period).mean()
+        history_df["fast_ma"] = history_df["close"].ewm(span=self.fast_ma_window, adjust=True).mean()
+        history_df["slow_ma"] = history_df["close"].ewm(span=self.slow_ma_window, adjust=True).mean()
+        daily_open = history_df["open"].resample("D", label="left", closed="left").first().ffill()
+        
+        with self.lock:
+            self.history = history_df
+            self.daily_open = daily_open
+            self.latest_atr = float(history_df["atr"].iloc[-1])
+            self.latest_fast_ma = float(history_df["fast_ma"].iloc[-1])
+            self.latest_slow_ma = float(history_df["slow_ma"].iloc[-1])
+            self.latest_lower_band = daily_open.iloc[-1] - self.band_std_dev * self.latest_vol_d
+            self.latest_upper_band = daily_open.iloc[-1] + self.band_std_dev * self.latest_vol_d
             
     def on_bar_closed(self, bar: pd.Series):
         self.refresh_vol_data()
-        logger.info(f"bar closed at %s | close=%.2f | vol_z=%.2f vol_regime=%s | fast_ma=%.2f slow_ma=%.2f trend=%s",
+        logger.info(f"bar closed at %s | close=%.2f | vol_rank=%.1f vol_regime=%s | fast_ma=%.2f slow_ma=%.2f trend=%s",
                     cast(pd.Timestamp, bar.name).strftime('%Y-%m-%d %H:%M %Z'),
                     bar["close"],
-                    self.latest_vol_z, "high" if self.latest_vol_z >= self.vol_z_entry_threshold else "low",
+                    self.latest_vol_rank, "high" if self.latest_vol_rank >= self.vol_rank_entry_threshold else "low",
                     self.latest_fast_ma, self.latest_slow_ma, "up" if self.latest_fast_ma > self.latest_slow_ma else "down")
         
-        if self._ready():
+        if self.is_ready():
             self.evaluate_signals()
             self.execute_trades()
 
-    def _ready(self):
-        return self.is_ready and self.is_vol_ready
+    def is_ready(self):
+        return self.is_bfill_fetched and self.is_vol_fetched
     
     # === SIGNAL EXECUTION ===
     
@@ -394,7 +407,7 @@ class HybridStrategy:
             if self.last_bar is None or self.curr_bar is None:
                 return
             
-            high_vol = self.latest_vol_z >= self.vol_z_entry_threshold
+            high_vol = self.latest_vol_rank >= self.vol_rank_entry_threshold
             
             if self.curr_state:
                 # exit trend following trades if we are in a high vol regime
@@ -501,7 +514,10 @@ class HybridStrategy:
         )))
         for o in open_orders:
             self.trading_client.cancel_order_by_id(o.id)
-        order = self.trading_client.close_position(self.asset.symbol)
+        try:
+            order = self.trading_client.close_position(self.asset.symbol)
+        except:
+            return None
         return cast(Order, order)
             
     def upsert_sl_order(self, state: TradeState, price: float, update_state=True):

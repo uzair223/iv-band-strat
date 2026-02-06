@@ -26,8 +26,8 @@ timeframe = timedelta(hours=TIMEFRAME_HOURS)
 
 MR_EXPOSURE = float(os.getenv("MR_EXPOSURE", 1.0))
 TF_EXPOSURE = float(os.getenv("TF_EXPOSURE", 1.0))
-VOL_Z_WINDOW = int(os.getenv("VOL_Z_WINDOW", 21))
-VOL_Z_ENTRY_THRESHOLD = float(os.getenv("VOL_Z_ENTRY_THRESHOLD", 0.0))
+VOL_RANK_WINDOW = int(os.getenv("VOL_RANK_WINDOW", 5))
+VOL_RANK_ENTRY_THRESHOLD = float(os.getenv("VOL_RANK_ENTRY_THRESHOLD", 50.0))
 BAND_STD_DEV = float(os.getenv("BAND_STD_DEV", 0.8))
 
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", days_to_bars(WEEK, timeframe)))
@@ -37,7 +37,7 @@ SLOW_MA_WINDOW = int(os.getenv("SLOW_MA_WINDOW", days_to_bars(MONTH, timeframe))
 
 LONG_ONLY = os.getenv("LONG_ONLY", "0") == "1"
 PAPER = os.getenv("PAPER", "1") == "1"
-DELAYED_BACKFILL = os.getenv("DELAYED_BACKFILL", "1") == "1"
+DELAYED_BACKFILL = os.getenv("DELAYED_BACKFILL", "0") == "1"
 
 if not API_KEY or not SECRET_KEY:
     raise ValueError("API_KEY and SECRET_KEY must be set")
@@ -48,8 +48,8 @@ strat = HybridStrategy(
     timeframe=timeframe,
     mr_exposure=MR_EXPOSURE,
     tf_exposure=TF_EXPOSURE,
-    vol_z_window=VOL_Z_WINDOW,
-    vol_z_entry_threshold=VOL_Z_ENTRY_THRESHOLD,
+    vol_rank_window=VOL_RANK_WINDOW,
+    vol_rank_entry_threshold=VOL_RANK_ENTRY_THRESHOLD,
     band_std_dev=BAND_STD_DEV,
     atr_period=ATR_PERIOD,
     atr_multiplier=ATR_MULTIPLIER,
