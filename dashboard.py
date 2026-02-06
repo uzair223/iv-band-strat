@@ -127,7 +127,7 @@ def update(_):
             )
         )
 
-        return fig, trend_text, regime_text, f"{vol_rank:.1%}", f"{vol_d:.2%}", pos_text
+        return fig, trend_text, regime_text, f"{vol_rank:.1f}", f"{vol_d:.2%}", pos_text
 
     except Exception as e:
         logger.error(f"Dashboard error: {e}")

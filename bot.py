@@ -236,7 +236,7 @@ class HybridStrategy:
                     self.vol_history.index = pd.to_datetime(self.vol_history.index).tz_localize("America/New_York")
                     self.calc_vol_stats()
                     self.is_vol_fetched = True
-                logger.info(f"volatility history updated. fetched {len(rows)} rows. {self.latest_vol_rank=:.2f}, {self.latest_vol_d=:.2f}")
+                logger.info(f"volatility history updated. fetched {len(rows)} rows. {self.latest_vol_rank=:.1f}, {self.latest_vol_d=:.2f}")
         except Exception as e:
             e.add_note("error fetching volatility data from source")
             logger.exception(e)
