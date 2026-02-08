@@ -2,14 +2,15 @@ import asyncio
 import threading
 import logging
 from math import ceil
-from typing import cast, Optional
+from typing import Callable, cast, Optional, Any
 
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
+import aiohttp
+from urllib.parse import urlencode
 from uuid import uuid4
 
 # Alpaca SDK
@@ -27,6 +28,30 @@ from alpaca.data import (
     BarSet, Bar
 )
 from alpaca.data.live.stock import StockDataStream
+class AlpacaConnectionLimitFilter(logging.Filter):
+    def __init__(self):
+        self.only_log_once = dict()
+        
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "starting data websocket connection" in msg:
+            return False
+        
+        if "connecting to" in msg or "data websocket error" in msg:
+            if self.only_log_once.get(msg, False):
+                return False
+            self.only_log_once[msg] = True
+            
+        if "connection limit exceeded" in msg:
+            if self.only_log_once.get(msg, False):
+                return False
+            record.exc_info = None
+            record.stack_info = None
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+            self.only_log_once[msg] = True
+        return True
+logging.getLogger("alpaca.data.live.websocket").addFilter(AlpacaConnectionLimitFilter())
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +78,8 @@ class TradeState:
     strategy: Strategy
     side: OrderSide
     qty: float
+    filled_at: datetime
+    filled_price: float
     uid: str
     last_stop_price: Optional[float] = None
     with_sl: bool = False
@@ -114,6 +141,7 @@ class HybridStrategy:
                  mr_exposure: float = 0.1,
                  tf_exposure: float = 0.1,
                  feed=DataFeed.IEX, long_only=False, paper=True, delayed_backfill=True,
+                 vol_fetch_timeout = 300,
                  vol_symbol:Optional[str]=None, pos_symbol: Optional[str]=None):
 
         self.curr_state: Optional[TradeState] = None
@@ -155,6 +183,7 @@ class HybridStrategy:
         
         self.minute_bar_count = 0
         self.delayed_backfill = delayed_backfill
+        self.vol_fetch_timeout = vol_fetch_timeout
         
         # Data Buffers
         self.minute_buffer = pd.DataFrame() # Raw 1m bars
@@ -190,16 +219,17 @@ class HybridStrategy:
         tasks = [
             asyncio.create_task(self.data_stream._run_forever()),
             asyncio.create_task(self.trading_stream._run_forever()),
-            asyncio.create_task(asyncio.to_thread(self.refresh_vol_data))
+            asyncio.create_task(self.fetch_vol_from_source())
         ]
         clock = cast(Clock, self.trading_client.get_clock())
         if not self.delayed_backfill or not clock.is_open:
-            tasks.append(asyncio.create_task(asyncio.to_thread(self.fetch_backfill)))
+            tasks.append(asyncio.create_task(self.fetch_backfill()))
         else:
             logger.info("delayed backfill enabled; waiting for 15 mins of data")
         
         try:
-            await asyncio.gather(*tasks)
+            for task in tasks:
+                await task
         except asyncio.CancelledError:
             pass
         finally:
@@ -216,37 +246,102 @@ class HybridStrategy:
         
     # === VOLATILITY DATA MANAGEMENT ===
     
-    def fetch_vol_from_source(self):
-        logger.info("fetching volatility data from source")
+    async def _with_retries(
+        self,
+        func: Callable[[], Any],
+        name="request",
+        max_retries=5,
+        base_delay=1.0,
+    ):
+        for attempt in range(1, max_retries + 1):
+            if self.shutdown.is_set():
+                logger.info(f"aborting {name}: shutdown requested")
+                return
+
+            try:
+                return await func()
+            except Exception as e:
+                if attempt >= max_retries:
+                    e.add_note(f"failed {name} (retries exhausted)")
+                    logger.exception(e)
+                    return
+
+                delay = base_delay * (2 ** (attempt - 1))
+                e.add_note("failed %s (attempt %d/%d). retrying in %.1fs" % (name, attempt, max_retries, delay))
+                logger.exception(e)
+
+                try:
+                    await asyncio.wait_for(self.shutdown.wait(), timeout=delay)
+                    logger.info(f"aborting {name}: shutdown during backoff")
+                    return
+                except asyncio.TimeoutError:
+                    pass
+    
+    async def fetch_vol_from_source(self):
         self.is_vol_fetched = False
-        query = "SELECT DATE_ADD(date, INTERVAL 1 DAY) as timestamp, iv_current as vol FROM volatility_history WHERE act_symbol = '%s' ORDER BY date DESC LIMIT %d"
-        try:
-            owner, database, branch = "post-no-preference", "options", "master"
-            res = requests.get(
-                f"https://www.dolthub.com/api/v1alpha1/{owner}/{database}/{branch}",
-                params={"q": query % (self.vol_symbol, 50 + self.vol_rank_window * 3) }
-            )
-            data: dict = res.json()
-            if (data["query_execution_status"] != "Success"):
-                raise ValueError(data["query_execution_message"])
+
+        query = (
+            "SELECT DATE_ADD(date, INTERVAL 1 DAY) as timestamp, iv_current as vol "
+            "FROM volatility_history "
+            "WHERE act_symbol = '%s' "
+            "ORDER BY date DESC "
+            "LIMIT %d"
+        )
+        
+
+        owner, database, branch = "post-no-preference", "options", "master"
+        url = f"https://www.dolthub.com/api/v1alpha1/{owner}/{database}/{branch}"
+        params = {"q": query % (self.vol_symbol, 50+self.vol_rank_window * 3)}
+        qurl = f"{url}?{urlencode(params)}"
+
+        logger.info("fetching volatility data from source: %s", qurl)
+        async def func():
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=self.vol_fetch_timeout)) as res:
+                    res.raise_for_status()
+                    data: dict = await res.json()
+
+            if data.get("query_execution_status") != "Success":
+                raise ValueError(data.get("query_execution_message"))
+
             rows = data.get("rows", [])
-            if rows:
-                with self.lock:
-                    self.vol_history = pd.DataFrame(rows, columns=["timestamp", "vol"]).set_index("timestamp")
-                    self.vol_history.index = pd.to_datetime(self.vol_history.index).tz_localize("America/New_York")
-                    self.calc_vol_stats()
-                    self.is_vol_fetched = True
-                logger.info(f"volatility history updated. fetched {len(rows)} rows. {self.latest_vol_rank=:.1f}, {self.latest_vol_d=:.2f}")
-        except Exception as e:
-            e.add_note("error fetching volatility data from source")
-            logger.exception(e)
-            
-    def refresh_vol_data(self):
+            if not rows:
+                logger.warning("volatility query returned no rows")
+                return
+
+            with self.lock:
+                self.vol_history = (
+                    pd.DataFrame(rows, columns=["timestamp", "vol"])
+                    .set_index("timestamp")
+                )
+                self.vol_history.index = (
+                    pd.to_datetime(self.vol_history.index)
+                    .tz_localize("America/New_York")
+                )
+                self.is_vol_fetched = True
+
+            self.calc_vol_stats()
+            await self.resample_and_sync(True)
+
+            logger.info(
+                "volatility history updated. fetched %d rows. %s, %s",
+                len(rows),
+                f"{self.latest_vol_rank=:.1f}",
+                f"{self.latest_vol_d=:.2f}",
+            )
+
+        return await self._with_retries(func, name="fetch volatility data")
+
+    async def refresh_vol_data(self):
         now = datetime.now(UTC)
-        refresh_threshold = now.replace(hour=6, minute=45, second=0, microsecond=0)
-        if now >= refresh_threshold and self.last_vol_refresh_time < refresh_threshold:
-                self.fetch_vol_from_source()
+        refresh_threshold = now.replace(hour=7, minute=0, second=0, microsecond=0)
+        if (
+            now >= refresh_threshold
+            and self.last_vol_refresh_time < refresh_threshold
+            and not self.shutdown.is_set()
+        ):
                 self.last_vol_refresh_time = now
+                await self.fetch_vol_from_source()
 
     def calc_vol_stats(self):
         with self.lock:
@@ -263,7 +358,7 @@ class HybridStrategy:
 
     # === DATA INGESTION & AGGREGATION ===
     
-    def fetch_backfill(self):
+    async def fetch_backfill(self):
         if cast(Clock, self.trading_client.get_clock()).is_open:
             logger.info("backfilling historical bars")
             now = datetime.now(UTC)
@@ -296,9 +391,9 @@ class HybridStrategy:
         with self.lock:
             buf = pd.concat([fetched_df, self.minute_buffer]).drop_duplicates().sort_index()
             self.minute_buffer = buf
-            self.resample_and_sync()
             self.is_bfill_fetched = True
-            logger.info(f"warmup complete. buffer size: {len(self.minute_buffer)} mins.")
+        await self.resample_and_sync(True)
+        logger.info(f"warmup complete. buffer size: {len(self.minute_buffer)} mins.")
 
     async def handle_minute_bar(self, bar: Bar):
         self.minute_bar_count += 1
@@ -313,9 +408,9 @@ class HybridStrategy:
             )
             if len(self.minute_buffer) > self.max_buf:
                 self.minute_buffer = self.minute_buffer.iloc[-self.max_buf:]
-            self.resample_and_sync()
+            await self.resample_and_sync()
 
-    def resample_and_sync(self):
+    async def resample_and_sync(self, executed_on_backfill=False):
         with self.lock:
             minute_df = self.minute_buffer.copy().tz_convert("America/New_York")
         if minute_df.empty: return
@@ -348,8 +443,8 @@ class HybridStrategy:
                 self.last_bar = resampled.iloc[-2]
                 
             self.calc_indicators()
-            if self.is_ready() and self.is_closing_bar(latest_mbar_time):
-                self.on_bar_closed(resampled.iloc[-1])
+            if not executed_on_backfill and self.is_closing_bar(latest_mbar_time):
+                await self.on_bar_closed(resampled.iloc[-1])
                 
             
     def is_closing_bar(self, ts: datetime):
@@ -382,8 +477,8 @@ class HybridStrategy:
             self.latest_lower_band = daily_open.iloc[-1] - self.band_std_dev * self.latest_vol_d
             self.latest_upper_band = daily_open.iloc[-1] + self.band_std_dev * self.latest_vol_d
             
-    def on_bar_closed(self, bar: pd.Series):
-        self.refresh_vol_data()
+    async def on_bar_closed(self, bar: pd.Series):
+        await self.refresh_vol_data()
         logger.info(f"bar closed at %s | close=%.2f | vol_rank=%.1f vol_regime=%s | fast_ma=%.2f slow_ma=%.2f trend=%s",
                     cast(pd.Timestamp, bar.name).strftime('%Y-%m-%d %H:%M %Z'),
                     bar["close"],
@@ -606,13 +701,14 @@ class HybridStrategy:
                 continue
             if parsed.type == ParsedClientIdType.ENTRY:
                 self.curr_state = TradeState(
-                    symbol=self.asset.symbol,
+                    symbol=o.symbol, # type: ignore
                     strategy=parsed.strategy,
                     side=o.side,
-                    qty=abs(float(o.qty)),
-                    uid=parsed.uid,
+                    qty=int(o.qty),
+                    filled_at=o.filled_at.replace(tzinfo=UTC), # type: ignore
+                    filled_price=float(o.filled_avg_price), # type: ignore
                     with_sl=bool(parsed.with_sl),
-                    sl_apca_id=None
+                    uid=parsed.uid,
                 )
                 break
             
@@ -644,7 +740,7 @@ class HybridStrategy:
         if order.symbol != self.asset.symbol:
             return
         
-        if not order.symbol or not order.side or not order.qty or not order.id or not order.filled_avg_price:
+        if not order.symbol or not order.side or not order.qty or not order.id or not order.filled_avg_price or not order.filled_at:
             logger.error("incomplete order data; cannot process fill")
             return
         
@@ -663,8 +759,10 @@ class HybridStrategy:
                 symbol=order.symbol,
                 strategy=parsed.strategy,
                 side=order.side,
-                with_sl=bool(parsed.with_sl),
                 qty=int(order.qty),
+                filled_at=order.filled_at.replace(tzinfo=UTC),
+                filled_price=float(order.filled_avg_price),
+                with_sl=bool(parsed.with_sl),
                 uid=parsed.uid,
             )
             stop_order = self.upsert_sl_order(self.curr_state, float(order.filled_avg_price))[0]

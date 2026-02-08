@@ -1,9 +1,11 @@
+from typing import cast
 from dash import Dash, dcc, html, callback, Input, Output
 import dash_bootstrap_components as dbc
 import plotly.graph_objs as go
 import numpy as np
 import pandas as pd
 from bot import HybridStrategy
+from alpaca.trading.enums import OrderSide
 
 import logging
 logger = logging.getLogger(__name__)
@@ -19,7 +21,8 @@ def create_card(label, value, id):
     return dbc.Card(
         dbc.CardBody([
             html.H6(label, className="card-subtitle text-muted"),
-            html.H4(value, id=id, className="card-title"),
+            html.H4(value, id=id, className="card-title mb-0"),
+            html.P(None, id=f"{id}-desc", className="card-text")
         ]),
         className="mb-2"
     )
@@ -51,13 +54,14 @@ app.layout = dbc.Container([
      Output("card-regime", "children"),
      Output("card-vol-z", "children"),
      Output("card-vol-d", "children"),
-     Output("card-pos", "children")],
+     Output("card-pos", "children"),
+     Output("card-pos-desc", "children")],
     [Input("interval-component", "n_intervals")]
 )
 def update(_):
     try:
         if dashboard is None or not dashboard.strat.is_ready():
-            return go.Figure(), "-", "-", "-", "-", "-"
+            return go.Figure(), "-", "-", "-", "-", "-", None
         
         strat = dashboard.strat
         
@@ -84,15 +88,23 @@ def update(_):
         df["lower_band"] = df["daily_open"] * (1 - vol_move_dist)
 
         x_axis = np.arange(len(df))
+        index = cast(pd.DatetimeIndex, df.index)
         
         # Determine Card Values
         regime_text = "High Vol" if vol_rank >= strat.vol_rank_entry_threshold else "Low Vol"
         trend_text = "Bullish" if fast_ma > slow_ma else "Bearish"
-        pos_text = f"{curr_state.side} {curr_state.qty} (@{curr_state.strategy})" if curr_state else "Flat"
+        
+        if curr_state:
+            pos_text = curr_state.strategy.value
+            pos_desc = f"{curr_state.side.value.upper()} {curr_state.qty} @ {curr_state.filled_price}"
+        else:
+            pos_text = "Flat"
+            pos_desc = None
+            
 
         # Build Graph
         fig = go.Figure()
-
+            
         # 1. Price Subplot
         fig.add_trace(go.Candlestick(
             x=x_axis, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
@@ -106,6 +118,18 @@ def update(_):
         fig.add_trace(go.Scatter(x=x_axis, y=df["fast_ma"], line=dict(color='orange', width=1.5), legendgroup="MA", name="Fast MA"))
         fig.add_trace(go.Scatter(x=x_axis, y=df["slow_ma"], line=dict(color='magenta', width=1.5), legendgroup="MA", name="Slow MA"))
 
+        if curr_state:
+            sell = curr_state.side == OrderSide.SELL
+            x = index.get_indexer([pd.Timestamp(curr_state.filled_at).tz_convert("America/New_York")], method="nearest")[0] # type: ignore
+            y = 1.005*df["high"].iloc[x] if sell else 0.995*df["low"].iloc[x]
+            marker = dict(color="red", size=10, symbol="triangle-down") if sell else dict(color="green", size=10, symbol="triangle-up")
+            
+            fig.add_trace(go.Scatter(
+                x=[x], y=[y], text=[f"{curr_state.qty} @ {curr_state.filled_price}"], textposition=["top center" if sell else "bottom center"],
+                mode="markers+text", marker=marker, textfont=dict(color="black", size=10),
+                name="Entry Point"
+            ))
+            
         # 2. Volatility Subplot
         fig.add_trace(go.Scatter(x=x_axis, y=df["vol_rank"], name="Vol Rank", yaxis="y2", line=dict(color='gold')))
         fig.add_hline(y=strat.vol_rank_entry_threshold, line_dash="dash", line_color="red", yref="y2")
@@ -121,17 +145,17 @@ def update(_):
             yaxis2=dict(title="Vol Rank", domain=[0, 0.25]),
             xaxis=dict(
                 tickvals=x_axis,
-                ticktext=df.index.strftime("%a %b %d %H:%M"), # type: ignore
+                ticktext=index.strftime("%a %b %d %H:%M"),
                 showgrid=False,
                 showticklabels=False,
             )
         )
 
-        return fig, trend_text, regime_text, f"{vol_rank:.1f}", f"{vol_d:.2%}", pos_text
+        return fig, trend_text, regime_text, f"{vol_rank:.1f}", f"{vol_d:.2%}", pos_text, pos_desc
 
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
-        return go.Figure(), "Error", "Error", "Error", "Error", "Error"
+        return go.Figure(), "Error", "Error", "Error", "Error", "Error", None
 
 class Dashboard:
     def __init__(self, strat: HybridStrategy):

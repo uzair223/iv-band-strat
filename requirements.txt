@@ -1,3 +1,4 @@
+aiohttp
 alpaca-py
 dash
 dash-bootstrap-components
