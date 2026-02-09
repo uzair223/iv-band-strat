@@ -319,6 +319,7 @@ class HybridStrategy:
                     .tz_localize("America/New_York")
                 )
                 self.is_vol_fetched = True
+                self.last_vol_refresh_time = datetime.now(UTC)
 
             self.calc_vol_stats()
             await self.resample_and_sync(True)
@@ -340,7 +341,6 @@ class HybridStrategy:
             and self.last_vol_refresh_time < refresh_threshold
             and not self.shutdown.is_set()
         ):
-                self.last_vol_refresh_time = now
                 await self.fetch_vol_from_source()
 
     def calc_vol_stats(self):
@@ -398,13 +398,13 @@ class HybridStrategy:
     async def handle_minute_bar(self, bar: Bar):
         self.minute_bar_count += 1
         if self.minute_bar_count == 15 and self.delayed_backfill:
-            await asyncio.to_thread(self.fetch_backfill)
+            await self.fetch_backfill(True)
         
         new_row = pd.DataFrame([bar.model_dump()]).set_index("timestamp").tz_convert("America/New_York")
         with self.lock:
             self.minute_buffer = pd.concat([self.minute_buffer, new_row]).sort_index()
             self.minute_buffer.index = (
-                pd.to_datetime(self.minute_buffer.index)
+                pd.to_datetime(self.minute_buffer.index).tz_convert("America/New_York")
             )
             if len(self.minute_buffer) > self.max_buf:
                 self.minute_buffer = self.minute_buffer.iloc[-self.max_buf:]
@@ -412,7 +412,7 @@ class HybridStrategy:
 
     async def resample_and_sync(self, executed_on_backfill=False):
         with self.lock:
-            minute_df = self.minute_buffer.copy().tz_convert("America/New_York")
+            minute_df = self.minute_buffer.copy()
         if minute_df.empty: return
 
         resampled = (
