@@ -313,6 +313,7 @@ class HybridStrategy:
                 self.vol_history = (
                     pd.DataFrame(rows, columns=["timestamp", "vol"])
                     .set_index("timestamp")
+                    .sort_index()
                 )
                 self.vol_history.index = (
                     pd.to_datetime(self.vol_history.index)
@@ -398,7 +399,7 @@ class HybridStrategy:
     async def handle_minute_bar(self, bar: Bar):
         self.minute_bar_count += 1
         if self.minute_bar_count == 15 and self.delayed_backfill:
-            await self.fetch_backfill(True)
+            await self.fetch_backfill()
         
         new_row = pd.DataFrame([bar.model_dump()]).set_index("timestamp").tz_convert("America/New_York")
         with self.lock:
